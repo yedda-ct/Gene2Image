@@ -19,3 +19,10 @@ checkpoints/
 *.npy
 *.npz
 .DS_Store
+
+code/logs/
+
+code/results_smoke/
+code/slurm/logs/
+	
+

@@ -117,7 +117,7 @@ export GMT_HALLMARK=/data/horse/ws/<你的ws>-gene2image/gmt/h.all.v2023.2.Hs.sy
 ```bash
 cd /data/horse/ws/<你的ws>-gene2image/Gene2Image/code
 mkdir -p logs
-sbatch --export=ALL,PROJECT_DIR=$PWD,VENV_DIR=$VENV_DIR,\
+sbatch --exclude=i8009 --export=ALL,PROJECT_DIR=$PWD,VENV_DIR=$VENV_DIR,\
 RELEASE_MODULE=$RELEASE_MODULE,PYTORCH_MODULE=$PYTORCH_MODULE,GMT_HALLMARK=$GMT_HALLMARK \
   slurm/smoke_test.slurm
 squeue -u $USER                  # 看状态：PD 排队 / R 运行

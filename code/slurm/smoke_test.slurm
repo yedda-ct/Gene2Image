@@ -28,10 +28,14 @@ set -euo pipefail
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  ★ TODO：与 setup_env.sh 顶部保持一致                                       ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-PROJECT_DIR="${PROJECT_DIR:-/data/horse/ws/CHANGEME-gene2image/Gene2Image/code}"
-VENV_DIR="${VENV_DIR:-/data/horse/ws/CHANGEME-gene2image/venv}"
-RELEASE_MODULE="${RELEASE_MODULE:-release/CHANGEME}"     # module spider release
-PYTORCH_MODULE="${PYTORCH_MODULE:-PyTorch/CHANGEME}"     # module spider PyTorch
+PROJECT_DIR="${PROJECT_DIR:-/data/horse/ws/chwu350f-g2i/Gene2Image/code}"
+VENV_DIR="${VENV_DIR:-/data/horse/ws/chwu350f-g2i/venv_piptorch}"
+RELEASE_MODULE="${RELEASE_MODULE:-release/24.10}"     # module spider release
+
+
+GCCCORE_MODULE="${GCCCORE_MODULE:-GCCcore/13.2.0}"
+PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.5}"
+
 # ★ 离线通路库 .gmt（计算节点无外网时填；有外网留空走 gseapy）：
 GMT_HALLMARK="${GMT_HALLMARK:-}"
 DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data/processed_data}"
@@ -42,8 +46,10 @@ CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUTPUT_DIR}"          # 检查点落在 $OUTP
 # ---------------------------------------------------------------------------
 # 环境
 # ---------------------------------------------------------------------------
-module purge
-module load "${RELEASE_MODULE}" "${PYTORCH_MODULE}"
+
+module --force purge >/dev/null 2>&1 || module purge || true
+module load "${RELEASE_MODULE}" "${GCCCORE_MODULE}" "${PYTHON_MODULE}"
+
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 
