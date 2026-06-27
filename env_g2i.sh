@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 
-export WS=/data/horse/ws/chwu350f-g2i
-export G2I=$WS/Gene2Image
 
-export GMT_HALLMARK=$G2I/gmt/msigdb_2023.2_Hs/h.all.v2023.2.Hs.symbols.gmt
+export PROJECT_DIR=/data/horse/ws/chwu350f-g2i/Gene2Image/code
+export VENV_DIR=/data/horse/ws/chwu350f-g2i/venv_piptorch
+export RELEASE_MODULE=release/24.10
+export GCCCORE_MODULE=GCCcore/13.2.0
+export PYTHON_MODULE=Python/3.11.5
+export DATA_DIR=$PROJECT_DIR/data/processed_data
+export OUTPUT_DIR=$PROJECT_DIR/results
+export CHECKPOINT_DIR=$OUTPUT_DIR
 
-# Optional: only needed when INCLUDE_REACTOME=1
-export GMT_REACTOME=$G2I/gmt/msigdb_2023.2_Hs/c2.cp.reactome.v2023.2.Hs.symbols.gmt
+
+export COMMON="ALL,PROJECT_DIR,VENV_DIR,RELEASE_MODULE,GCCCORE_MODULE,PYTHON_MODULE,DATA_DIR,OUTPUT_DIR,CHECKPOINT_DIR"
