@@ -13,6 +13,7 @@
 # =============================================================================
 #SBATCH --job-name=g2i_smoke
 #SBATCH --partition=alpha
+#SBATCH --exclude=i8009
 #SBATCH --account=swtest
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -22,6 +23,7 @@
 #SBATCH --time=00:30:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
+
 
 set -euo pipefail
 

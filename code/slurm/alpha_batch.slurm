@@ -26,6 +26,7 @@
 # =============================================================================
 #SBATCH --job-name=g2i_batch
 #SBATCH --partition=alpha
+#SBATCH --exclude=i8009
 #SBATCH --account=swtest
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -42,10 +43,17 @@ set -euo pipefail
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  ★ TODO：Alpha 站点变量（所有批次共享，OUTPUT_DIR 必须始终一致）           ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-PROJECT_DIR="${PROJECT_DIR:-/data/horse/ws/CHANGEME-gene2image/Gene2Image/code}"
-VENV_DIR="${VENV_DIR:-/data/horse/ws/CHANGEME-gene2image/venv}"
-RELEASE_MODULE="${RELEASE_MODULE:-release/CHANGEME}"     # module spider release
-PYTORCH_MODULE="${PYTORCH_MODULE:-PyTorch/CHANGEME}"     # module spider PyTorch
+
+
+PROJECT_DIR="${PROJECT_DIR:-/data/horse/ws/chwu350f-g2i/Gene2Image/code}"
+VENV_DIR="${VENV_DIR:-/data/horse/ws/chwu350f-g2i/venv_piptorch}"
+RELEASE_MODULE="${RELEASE_MODULE:-release/24.10}"     # module spider release
+
+
+GCCCORE_MODULE="${GCCCORE_MODULE:-GCCcore/13.2.0}"
+PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.5}"
+
+
 GMT_HALLMARK="${GMT_HALLMARK:-}"
 GMT_REACTOME="${GMT_REACTOME:-}"
 DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data/processed_data}"
@@ -56,8 +64,10 @@ INTERPRET_SEED="${INTERPRET_SEED:-42}"
 
 : "${BATCH:?必须设置 BATCH=1..8，例如 sbatch -J g2i_b1 --export=ALL,BATCH=1 slurm/alpha_batch.slurm}"
 
-module purge
-module load "${RELEASE_MODULE}" "${PYTORCH_MODULE}"
+module --force purge >/dev/null 2>&1 || module purge || true
+module load "${RELEASE_MODULE}" "${GCCCORE_MODULE}" "${PYTHON_MODULE}"
+
+
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 cd "${PROJECT_DIR}"; mkdir -p logs

@@ -24,6 +24,7 @@
 # =============================================================================
 #SBATCH --job-name=g2i_train8
 #SBATCH --partition=alpha
+#SBATCH --exclude=i8009
 #SBATCH --account=swtest
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -40,25 +41,38 @@ set -euo pipefail
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  ★ TODO：与 setup_env.sh / smoke_test.slurm 顶部保持一致                    ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-PROJECT_DIR="${PROJECT_DIR:-/data/horse/ws/CHANGEME-gene2image/Gene2Image/code}"
-VENV_DIR="${VENV_DIR:-/data/horse/ws/CHANGEME-gene2image/venv}"
-RELEASE_MODULE="${RELEASE_MODULE:-release/CHANGEME}"     # module spider release
-PYTORCH_MODULE="${PYTORCH_MODULE:-PyTorch/CHANGEME}"     # module spider PyTorch
+
+PROJECT_DIR="${PROJECT_DIR:-/data/horse/ws/chwu350f-g2i/Gene2Image/code}"
+VENV_DIR="${VENV_DIR:-/data/horse/ws/chwu350f-g2i/venv_piptorch}"
+RELEASE_MODULE="${RELEASE_MODULE:-release/24.10}"     # module spider release
+
+
+GCCCORE_MODULE="${GCCCORE_MODULE:-GCCcore/13.2.0}"
+PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.5}"
+
+
+GMT_HALLMARK="${GMT_HALLMARK:-}"
+GMT_REACTOME="${GMT_REACTOME:-}"
+DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data/processed_data}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/results}"        # ★ 所有批次必须相同
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUTPUT_DIR}"
+INTERPRET_SEED="${INTERPRET_SEED:-42}"
+
+
 # ★ 离线通路库 .gmt（计算节点无外网时填；有外网留空走 gseapy）。
 #   无外网且这里为空 → run_all.sh 会在建掩码失败后 fail-fast 报错退出（这是有意的，
 #   避免 gene2image 臂静默崩溃）。请务必在无外网时填好 GMT_HALLMARK（和 Reactome 若用）。
-GMT_HALLMARK="${GMT_HALLMARK:-}"
-GMT_REACTOME="${GMT_REACTOME:-}"   # 仅当跑 Hallmark+Reactome 扩展消融时需要
-DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data/processed_data}"
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/results}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUTPUT_DIR}"          # 检查点落在 $OUTPUT_DIR/<run>/checkpoints/
+# 仅当跑 Hallmark+Reactome 扩展消融时需要          # 检查点落在 $OUTPUT_DIR/<run>/checkpoints/
 # ───────────────────────────────────────────────────────────────────────────
 
 # ---------------------------------------------------------------------------
 # 环境
 # ---------------------------------------------------------------------------
-module purge
-module load "${RELEASE_MODULE}" "${PYTORCH_MODULE}"
+
+module --force purge >/dev/null 2>&1 || module purge || true
+module load "${RELEASE_MODULE}" "${GCCCORE_MODULE}" "${PYTHON_MODULE}"
+
+
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 
