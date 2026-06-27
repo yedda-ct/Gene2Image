@@ -175,10 +175,10 @@ sbatch -J g2i_b7 --export=$COMMON,BATCH=7 slurm/capella.slurm
 sbatch -J g2i_b8 --export=$COMMON,BATCH=8 slurm/alpha_batch.slurm
 
 # 办法 B（推荐，自动依赖）：记下批 1、批 4 的 jobid，用 afterok 串起来：
-JID1=$(sbatch -J g2i_b1 --parsable --export=$COMMON,BATCH=1 slurm/alpha_batch.slurm)
-JID4=$(sbatch -J g2i_b4 --parsable --export=$COMMON,BATCH=4 slurm/alpha_batch.slurm)
+JID1=$(sbatch -J g2i_b1 --parsable --export=$COMMON,BATCH=1 slurm/capella.slurm)
+JID4=$(sbatch -J g2i_b4 --parsable --export=$COMMON,BATCH=4 slurm/capella.slurm)
 sbatch -J g2i_b8 --dependency=afterok:$JID1:$JID4 \
-  --export=$COMMON,BATCH=8 slurm/alpha_batch.slurm
+  --export=$COMMON,BATCH=8 slurm/capella.slurm
 ```
 
 > `-J g2i_bN` 决定日志文件名（`logs/g2i_bN-<jobid>.out`），**别省略**。
