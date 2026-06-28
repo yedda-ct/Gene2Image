@@ -1,21 +1,19 @@
-﻿__pycache__/
+# Python 缓存（任意目录下）
+__pycache__/
 *.pyc
-.venv/
-venv/
-.env
-*.zip
-*.tar
-*.tar.gz
-*.rar
-data/
-datasets/
-outputs/
-runs/
-checkpoints/
-*.pt
-*.pth
-*.ckpt
-*.h5
-*.npy
-*.npz
-.DS_Store
+*.pyo
+
+# Jupyter 检查点（任意目录下）
+.ipynb_checkpoints/
+
+# 编辑器配置
+.vscode/
+
+code/data/
+# 但保留轻量的通路掩码（构造产物，便于复现）
+!code/data/pathway_masks/
+!code/data/pathway_masks/*.npz
+
+# 训练/评估产物
+code/results/
+code/logs/
