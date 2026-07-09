@@ -70,7 +70,7 @@ def main():
     # Data loading logic
     if args.hest1k_base_dir:
         if args.hest1k_sid is None or len(args.hest1k_sid) == 0:
-            hest_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/data/HEST-1k/data/HEST_v1_1_0.csv")
+            hest_metadata = pd.read_csv(os.environ.get("HEST_METADATA_CSV", "/depot/natallah/data/Mengbo/HnE_RNA/data/HEST-1k/data/HEST_v1_1_0.csv"))
             args.hest1k_sid = hest_metadata[(hest_metadata['st_technology']=='Xenium') & 
                                            (hest_metadata['species']=='Homo sapiens')]['id'].tolist()
         logger.info(f"Loading pre-processed HEST-1k data for sample {args.hest1k_sid}")

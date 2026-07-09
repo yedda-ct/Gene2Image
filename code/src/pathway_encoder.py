@@ -49,8 +49,11 @@ class PathwayMaskEmbedding(nn.Module):
             d_token: per-pathway token dimension.
             learnable: if False, weights are frozen (PathPrior).
             init_weight: optional Tensor [P, G] of fixed (pathway, gene) weights
-                (e.g. ssGSEA) used to initialise W; broadcast over d_token. When
-                given together with learnable=False this realises PathPrior.
+                (e.g. ssGSEA). Each edge's scalar weight scales a fixed, seeded,
+                zero-mean unit-norm per-edge d_token profile (NOT a plain scalar
+                broadcast over d_token: that yields c*ones tokens which the
+                transformer's pre-norm LayerNorm annihilates). When given together
+                with learnable=False this realises PathPrior.
         """
         super().__init__()
         mask = mask if torch.is_tensor(mask) else torch.as_tensor(mask)
@@ -73,9 +76,23 @@ class PathwayMaskEmbedding(nn.Module):
 
         if init_weight is not None:
             init_weight = init_weight if torch.is_tensor(init_weight) else torch.as_tensor(init_weight)
-            init_w = init_weight.to(torch.float32)[edge_p, edge_g]  # [E]
+            init_w = init_weight.to(torch.float32)[edge_p, edge_g]  # [E] scalar ssGSEA weight/edge
+            # Give each edge a FIXED, zero-mean, unit-norm d_token profile and scale it by
+            # the (frozen) ssGSEA scalar, instead of broadcasting the scalar into an
+            # all-ones vector. Broadcasting makes every pathway token equal to c*ones,
+            # i.e. the whole signal lies in the ones-direction — which the transformer's
+            # pre-norm LayerNorm removes (LayerNorm centres each token), collapsing every
+            # pathway token to a constant and rendering the PathPrior conditioning
+            # input-independent (breaks the RQ3 learnable-vs-fixed ablation). A zero-mean
+            # profile survives LayerNorm, so the ssGSEA-weighted expression still reaches
+            # the transformer. The profile uses a fixed seed (not the global RNG) so
+            # PathPrior is a genuinely fixed, reproducible encoder across run seeds.
+            _g = torch.Generator().manual_seed(1234567)
+            profile = torch.randn(self.E, self.d_token, generator=_g)
+            profile = profile - profile.mean(dim=1, keepdim=True)
+            profile = profile / (profile.norm(dim=1, keepdim=True) + 1e-8)
             with torch.no_grad():
-                self.W.copy_(init_w.unsqueeze(1).expand(-1, self.d_token).contiguous())
+                self.W.copy_(init_w.unsqueeze(1) * profile)
         else:
             nn.init.kaiming_uniform_(self.W, a=math.sqrt(5))
 

@@ -24,9 +24,20 @@ import sys
 logger = logging.getLogger(__name__)
 
 
-def load_uni2_h_model(device, model_path="/depot/natallah/data/Mengbo/HnE_RNA/GeneFlow/UNI2-h"):
-    """Load UNI2-h foundation model using official timm approach"""    
+def load_uni2_h_model(device, model_path=None):
+    """Load UNI2-h foundation model using official timm approach.
+
+    model_path resolution order: explicit argument > $UNI2H_MODEL_PATH env var >
+    legacy hard-coded default. The legacy default points at the original authors'
+    cluster and does not exist elsewhere, so on any other machine set
+    UNI2H_MODEL_PATH (or pass --uni2h_model_path) to the dir holding pytorch_model.bin.
+    """
     try:
+        if model_path is None:
+            model_path = os.environ.get(
+                "UNI2H_MODEL_PATH",
+                "/depot/natallah/data/Mengbo/HnE_RNA/GeneFlow/UNI2-h",
+            )
         logger.info(f"Loading UNI2-h model using timm from {model_path}")
         
         # UNI2-h specific architecture parameters from official documentation
@@ -80,8 +91,10 @@ def load_uni2_h_model(device, model_path="/depot/natallah/data/Mengbo/HnE_RNA/Ge
         # UNI2-h is a gated pathology model and an optional metric. Degrade
         # gracefully: return None so the caller falls back (ResNet / skips the
         # UNI2-h FID) instead of aborting the whole evaluation.
-        logger.warning(f"UNI2-h model unavailable ({e}); skipping UNI2-h metrics, "
-                       f"basic FID/SSIM/PSNR will still be computed.")
+        logger.warning(f"UNI2-h model unavailable ({e}); skipping UNI2-h metrics "
+                       f"(UNI2-h FID will be reported as NaN). To enable it, set "
+                       f"UNI2H_MODEL_PATH (or pass --uni2h_model_path) to a dir "
+                       f"containing pytorch_model.bin. Basic FID/SSIM/PSNR are unaffected.")
         return None, None, None
 
 

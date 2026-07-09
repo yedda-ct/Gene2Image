@@ -43,10 +43,20 @@ from src.dataset import (
 # from rectified.rectified_train_ddp import generate_images_with_rectified_flow
 from src.stain_normalization import normalize_staining_rgb_skimage_hist_match
 from rectified.utils import generate_images_with_rectified_flow
-from rectified.utils_uni2h import (
-    load_uni2_h_model, extract_uni2_h_embeddings, extended_biological_evaluation_uni2h,
-    calculate_uni2h_fid
-)
+# UNI2-h is an OPTIONAL pathology-FM metric. Its module pulls heavy deps (cv2, timm,
+# sklearn); guard the import so a missing dep degrades UNI2-h FID to N/A instead of
+# crashing the whole evaluation (basic FID/SSIM/PSNR are unaffected). Downstream calls
+# are already gated on `uni2h_model is not None`.
+try:
+    from rectified.utils_uni2h import (
+        load_uni2_h_model, extract_uni2_h_embeddings, extended_biological_evaluation_uni2h,
+        calculate_uni2h_fid
+    )
+except Exception as _uni2h_import_err:
+    load_uni2_h_model = extract_uni2_h_embeddings = extended_biological_evaluation_uni2h = calculate_uni2h_fid = None
+    logging.getLogger(__name__).warning(
+        f"UNI2-h eval unavailable (import failed: {_uni2h_import_err}); "
+        f"UNI2-h metrics -> N/A. Basic FID/SSIM/PSNR unaffected.")
 from rectified.utils_he2rna import *
 from rectified.utils_plot import save_all_evaluation_plots
 
@@ -291,8 +301,15 @@ def main():
     parser.add_argument('--batch_size', type=int, default=20, help='Per-GPU batch size for evaluation.')
     parser.add_argument('--max_samples', type=int, default=5000, help='Maximum number of samples to use from the dataset.')
     parser.add_argument('--use_ddp', action='store_true', help='Use Distributed Data Parallel evaluation.')
-    parser.add_argument('--he2rna_model_path', type=str, default='/depot/natallah/data/Mengbo/HnE_RNA/GeneFlow/sequoia/models/he2rna-skcm-0', 
-                           help='Path to pretrained HE2RNA model for RNA prediction validation')
+    parser.add_argument('--uni2h_model_path', type=str,
+                        default=os.environ.get('UNI2H_MODEL_PATH', '/depot/natallah/data/Mengbo/HnE_RNA/GeneFlow/UNI2-h'),
+                        help='Directory holding the UNI2-h foundation model pytorch_model.bin. '
+                             'Defaults to $UNI2H_MODEL_PATH, else the legacy authors-cluster path. '
+                             'Required for the biological UNI2-h FID metric; if the path is missing, '
+                             'UNI2-h FID is skipped and reported as NaN (basic FID/SSIM/PSNR unaffected).')
+    parser.add_argument('--he2rna_model_path', type=str,
+                        default=os.environ.get('HE2RNA_MODEL_PATH', '/depot/natallah/data/Mengbo/HnE_RNA/GeneFlow/sequoia/models/he2rna-skcm-0'),
+                        help='Path to pretrained HE2RNA model for RNA prediction validation. Defaults to $HE2RNA_MODEL_PATH.')
     parser.add_argument('--save_embeddings', action='store_true', default=True, help='Save UNI2-h embeddings for later analysis')
     parser.add_argument('--embeddings_output_path', type=str, default=None, help='Path to save embeddings (if None, saves to output_dir/embeddings)')
     
@@ -329,7 +346,10 @@ def main():
     np.random.seed(args.seed + rank)
 
     # Load UNI2-h model for biological validation and FID calculation
-    uni2h_model, uni2h_processor, uni2h_preprocess = load_uni2_h_model(device)
+    if load_uni2_h_model is not None:
+        uni2h_model, uni2h_processor, uni2h_preprocess = load_uni2_h_model(device, model_path=args.uni2h_model_path)
+    else:  # import guarded above (optional dep missing) -> UNI2-h path skipped
+        uni2h_model = uni2h_processor = uni2h_preprocess = None
     if rank == 0:
         if uni2h_model is not None:  # ← Check model, not processor
             logger.info("UNI2-h model loaded successfully for biological validation")
@@ -352,7 +372,7 @@ def main():
 
     if args.hest1k_base_dir:
         if args.hest1k_sid is None or len(args.hest1k_sid) == 0:
-            hest_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/data/HEST-1k/data/HEST_v1_1_0.csv")
+            hest_metadata = pd.read_csv(os.environ.get("HEST_METADATA_CSV", "/depot/natallah/data/Mengbo/HnE_RNA/data/HEST-1k/data/HEST_v1_1_0.csv"))
             args.hest1k_sid = hest_metadata[(hest_metadata['st_technology']=='Xenium') &
                                             (hest_metadata['species']=='Homo sapiens')]['id'].tolist()
         if rank == 0:
@@ -675,6 +695,14 @@ def main():
         if cross_eval:
             # Do not silently fall back to a same-panel load for cross-dataset eval.
             raise
+        if encoder_type == 'pathway':
+            # Never fall back to the RNA constructors for a pathway (Gene2Image /
+            # ablation) checkpoint. The feature-detection path below only builds RNA
+            # encoders, so strict=False would drop every pathway weight and silently
+            # evaluate a RANDOM-init encoder, reporting garbage metrics under the
+            # variant's name (multi-cell) or aborting with no metrics (single-cell).
+            # Fail loudly so the real load error surfaces.
+            raise
         if rank == 0:
             logger.warning(f"Failed to load model with current constructor: {e}")
             logger.info("Attempting to load with feature detection from checkpoint...")
@@ -814,7 +842,17 @@ def main():
 
     # Initialize evaluation components
     rectified_flow = RectifiedFlow(sigma_min=0.002, sigma_max=80.0)
-    inception_model = InceptionModel(device)
+    # Inception-v3 (ImageNet) backs FID; torchvision downloads its weights on first use.
+    # On an OFFLINE compute node that raises URLError -> guard it so a missing FID never
+    # crashes the whole eval (SSIM/PSNR/UNI2-h still computed). Pre-fetch on a login node.
+    try:
+        inception_model = InceptionModel(device)
+    except Exception as _inception_err:
+        inception_model = None
+        logger.warning(
+            f"Inception-v3 unavailable ({_inception_err}); overall_fid will be NaN. Pre-fetch on a "
+            f"login node: python -c \"import torchvision.models as m; m.inception_v3(weights='IMAGENET1K_V1')\" "
+            f"or set TORCH_HOME to a cached copy.")
 
     # Storage for metrics
     all_ssim_scores = []
@@ -938,22 +976,23 @@ def main():
             all_ssim_scores.extend(ssim_scores)
             all_psnr_scores.extend(psnr_scores)
 
-            # Extract features for traditional FID calculation
-            real_features = inception_model(real_images_tensor).cpu().numpy()
-            gen_features = inception_model(generated_images_tensor).cpu().numpy()
-            all_real_features_for_fid.append(real_features)
-            all_gen_features_for_fid.append(gen_features)
-
+            # Extract features for traditional FID (skip gracefully if Inception unavailable offline)
             per_sample_feat_dists = []
-            if real_features.shape[0] > 0: # Ensure batch is not empty
-                for i in range(real_features.shape[0]):
-                    r_feat = real_features[i]
-                    g_feat = gen_features[i]
-                    distance = np.linalg.norm(r_feat - g_feat)
-                    per_sample_feat_dists.append(distance)
-
-            # Calculate batch-wise traditional FID
-            batch_fid = calculate_fid(real_features, gen_features)
+            if inception_model is not None:
+                real_features = inception_model(real_images_tensor).cpu().numpy()
+                gen_features = inception_model(generated_images_tensor).cpu().numpy()
+                all_real_features_for_fid.append(real_features)
+                all_gen_features_for_fid.append(gen_features)
+                if real_features.shape[0] > 0: # Ensure batch is not empty
+                    for i in range(real_features.shape[0]):
+                        r_feat = real_features[i]
+                        g_feat = gen_features[i]
+                        distance = np.linalg.norm(r_feat - g_feat)
+                        per_sample_feat_dists.append(distance)
+                # Calculate batch-wise traditional FID
+                batch_fid = calculate_fid(real_features, gen_features)
+            else:
+                batch_fid = np.nan
             all_batch_fids_list.append(batch_fid)
 
             # UNI2-h FID calculation (optional: skipped if model unavailable).
@@ -1113,10 +1152,13 @@ def main():
     if rank == 0:
         logger.info("Computing final evaluation metrics...")
         
-        # Calculate overall traditional FID
-        all_real_features_concat = np.concatenate(all_real_features_for_fid, axis=0)
-        all_gen_features_concat = np.concatenate(all_gen_features_for_fid, axis=0)
-        overall_fid = calculate_fid(all_real_features_concat, all_gen_features_concat)
+        # Calculate overall traditional FID (NaN if Inception was unavailable -> no features)
+        if all_real_features_for_fid and all_gen_features_for_fid:
+            all_real_features_concat = np.concatenate(all_real_features_for_fid, axis=0)
+            all_gen_features_concat = np.concatenate(all_gen_features_for_fid, axis=0)
+            overall_fid = calculate_fid(all_real_features_concat, all_gen_features_concat)
+        else:
+            overall_fid = float('nan')
 
         # Calculate overall UNI2-h FID
         try:
