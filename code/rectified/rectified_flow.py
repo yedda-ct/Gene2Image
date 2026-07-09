@@ -245,28 +245,31 @@ class DOPRI5Solver:
                 t_i_batch = torch.ones(batch_size, device=device) * t_i
                 k.append(self.model(x_i, t_i_batch, rna_expr))
             
-            # Compute final stage (7th stage)
-            x_final = x.clone()
-            for j in range(5):
-                x_final = x_final + dt * self.a[5][j] * k[j]
-            
-            t_final = t + dt
-            t_final_batch = torch.ones(batch_size, device=device) * t_final
-            k.append(self.model(x_final, t_final_batch, rna_expr))
-            
-            # Compute 5th order solution
+            # Compute the 5th-order solution from stages k[0..5]. In Dormand-Prince
+            # this point is ALSO the node for the 7th (FSAL) stage: the tableau's
+            # a[6] row equals the b weights, so stage 7 is evaluated at x_next, t+dt.
             x_next = x.clone()
             for i in range(6):
                 x_next = x_next + dt * self.b[i] * k[i]
-            
-            # Compute 4th order solution for error estimation
+
+            # Compute the 7th (FSAL) stage at (x_next, t+dt). The previous code
+            # evaluated it at the 6th-stage node (reusing self.a[5] / range(5)), so
+            # x_final == the 6th-stage input and t_final == t + c[5]*dt == t + dt,
+            # yielding k[6] == k[5]. That corrupts the 4th-order estimate x_next_star
+            # (its b_star[6] term) and hence the error driving adaptive step control.
+            # The accepted x_next is unaffected (it uses only k[0..5]).
+            t_final = t + dt
+            t_final_batch = torch.ones(batch_size, device=device) * t_final
+            k.append(self.model(x_next, t_final_batch, rna_expr))
+
+            # Compute 4th order solution for error estimation (uses all 7 stages).
             x_next_star = x.clone()
             for i in range(7):
                 x_next_star = x_next_star + dt * self.b_star[i] * k[i]
-            
+
             # Error estimate
             error = x_next - x_next_star
-            
+
             return x_next, error
     
     def _compute_adaptive_step_size(self, error, x, dt):
@@ -357,6 +360,24 @@ class DOPRI5Solver:
                 logger.info(f"Generation progress: t={t:.4f}, dt={dt:.6f}, steps={step_count}")
         
         logger.info(f"DOPRI5 generation completed in {step_count} steps, final t={t:.4f}")
+
+        # --- Under-integration guard ---
+        # The adaptive step budget (num_steps) can be exhausted before t reaches 1.0 when
+        # the velocity field is stiff (e.g. a poorly fit / weaker-ablation model), which
+        # would otherwise return a partially-denoised (half-noise) sample and silently
+        # corrupt FID/SSIM/PSNR. Finish the leftover interval with bounded fixed DOPRI5
+        # steps so every returned sample is integrated to t=1.0.
+        _eps = 1e-4
+        if t < 1.0 - _eps:
+            logger.warning(
+                f"DOPRI5 step budget ({num_steps}) exhausted at t={t:.4f}; "
+                f"completing integration to t=1.0 with bounded fixed steps.")
+            _max_dt = max(initial_dt, (1.0 - t) / 20.0)
+            while t < 1.0 - _eps:
+                _dt = min(_max_dt, 1.0 - t)
+                x, _ = self._dormand_prince_step(x, t, _dt, rna_expr, batch_size, device)
+                t += _dt
+            logger.info(f"Under-integration completed to final t={t:.4f}.")
         
         # Log adaptive step size statistics
         if len(dt_history) > 1:

@@ -661,6 +661,15 @@ def main():
                 'img_channels': args.img_channels,
                 'img_size': args.img_size,
                 'encoder_type': args.encoder_type,
+                # RNA-encoder architecture flags — persisted so evaluation rebuilds
+                # the exact graph and labels the run from the checkpoint, instead of
+                # falling back to (possibly different) eval-time CLI defaults.
+                'use_gene_attention': args.use_gene_attention,
+                'use_multi_head_attention': args.use_multi_head_attention,
+                'use_feature_gating': args.use_feature_gating,
+                'use_residual_blocks': args.use_residual_blocks,
+                'use_layer_norm': args.use_layer_norm,
+                'use_gene_relations': args.use_gene_relations,
                 'pathway_db': args.pathway_db,
                 'pathway_mask': args.pathway_mask,
                 # Store as a torch tensor (not numpy) so checkpoints remain

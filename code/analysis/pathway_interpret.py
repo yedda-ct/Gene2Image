@@ -36,7 +36,7 @@ from rectified.utils import generate_images_with_rectified_flow
 # ---------------------------------------------------------------------------
 # model / data loading
 # ---------------------------------------------------------------------------
-def load_model(model_path, gene_dim, device):
+def load_model(model_path, gene_dim, device, gene_names=None):
     """Rebuild a single-cell Gene2Image model from a checkpoint's saved config."""
     ck = torch.load(model_path, map_location='cpu', weights_only=False)
     cfg = ck.get('config', {})
@@ -46,6 +46,25 @@ def load_model(model_path, gene_dim, device):
         raise ValueError(
             "pathway_interpret only supports single-cell pathway checkpoints "
             f"(model_type='single'); got model_type='{cfg.get('model_type')}'.")
+    # Hard gene-order guard (mirrors the train-side check in rectified_main.py and
+    # rectified_evaluate.py). The mask columns and every x[:, i] index are aligned to
+    # the TRAINING gene order stored in the checkpoint. load_state_dict only checks
+    # tensor shapes, so a same-length but reordered panel (a re-saved adata, a
+    # different layer) would load silently and every attention / intervention result
+    # (RQ4) would be computed on misaligned genes.
+    ckpt_gene_names = cfg.get('gene_names')
+    if ckpt_gene_names and gene_names is not None:
+        ck_g = [str(g) for g in ckpt_gene_names]
+        cur_g = [str(g) for g in gene_names]
+        if ck_g != cur_g:
+            n_mis = sum(1 for a, b in zip(ck_g, cur_g) if a != b)
+            first = next((i for i, (a, b) in enumerate(zip(ck_g, cur_g)) if a != b), 'NA')
+            raise ValueError(
+                f"Interpret gene order does not match the checkpoint's training gene "
+                f"order: len(ckpt)={len(ck_g)} vs len(eval)={len(cur_g)}, {n_mis} "
+                f"positions differ (first at index {first}). RQ4 outputs would be "
+                f"computed on misaligned conditioning; align the panel to the training "
+                f"adata / layer before interpreting.")
     mask = cfg['pathway_mask_array']
     mask = mask if torch.is_tensor(mask) else torch.tensor(np.asarray(mask))
     mask = mask.to(torch.float32)
@@ -72,12 +91,24 @@ def load_model(model_path, gene_dim, device):
 # A: endogeneity
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def analysis_A(model, loader, pathway_names, device, out_dir, max_batches=50):
-    """CLS->pathway attention, entropy and per-cell-type dominant pathways."""
+def analysis_A(model, loader, pathway_names, device, out_dir, cell_types=None,
+               max_batches=None, topk=5, min_cells=10):
+    """CLS->pathway attention: entropy (focus), global dominant pathways, and --
+    when cell types are available -- per-cell-type dominant pathways plus the
+    cross-cell-type Jaccard specificity the plan (Part 3 §2.4-A) asks for.
+
+    Args:
+        cell_types: optional {cell_id -> cell_type} map; enables the per-cell-type block.
+        max_batches: cap on batches (None = all cells; attention is a cheap forward pass).
+        topk: number of dominant pathways per cell type for the Jaccard specificity.
+        min_cells: cell types with fewer cells are excluded from the specificity metric.
+    """
     rows = []
     P = model.rna_encoder.embed.P
     pnames = pathway_names or [f"pathway_{i}" for i in range(P)]
     attn_sum = np.zeros(P, dtype=np.float64)   # accumulate per-pathway attention
+    ct_sum = {}    # cell_type -> np.array[P] summed attention
+    ct_count = {}  # cell_type -> #cells
     n_cells_total = 0
     n = 0
     for batch in loader:
@@ -92,10 +123,18 @@ def analysis_A(model, loader, pathway_names, device, out_dir, max_batches=50):
         n_cells_total += a.shape[0]
         for i in range(a.shape[0]):
             top = int(a[i].argmax())
-            rows.append({'cell_id': cell_ids[i], 'entropy': float(e[i]),
+            cid = cell_ids[i]
+            ct = cell_types.get(str(cid)) if cell_types else None
+            rows.append({'cell_id': cid, 'cell_type': ct, 'entropy': float(e[i]),
                          'top_pathway': pnames[top], 'top_attention': float(a[i, top])})
+            if ct is not None:
+                if ct not in ct_sum:
+                    ct_sum[ct] = np.zeros(P, dtype=np.float64)
+                    ct_count[ct] = 0
+                ct_sum[ct] += a[i]
+                ct_count[ct] += 1
         n += 1
-        if n >= max_batches:
+        if max_batches and n >= max_batches:
             break
 
     # Per-pathway mean attention across cells = the model's pathway-importance
@@ -114,6 +153,64 @@ def analysis_A(model, loader, pathway_names, device, out_dir, max_batches=50):
         'dominant_pathways': df['top_pathway'].value_counts().head(10).to_dict(),
         'mean_attention': pathway_scores,
     }
+
+    # --- Per-cell-type dominant pathways + cross-type Jaccard specificity (RQ4-A) ---
+    # For each cell type, the mean attention profile -> its top-k dominant pathways.
+    # Specificity = mean pairwise Jaccard DISTANCE between cell types' top-k sets
+    # (1 - |A n B|/|A u B|); higher => cell types focus on more distinct pathways,
+    # evidence that the model learned cell-type-specific pathway->morphology mapping.
+    per_ct, topk_sets = {}, {}
+    for ct, cnt in ct_count.items():
+        if cnt < min_cells:
+            continue
+        m = ct_sum[ct] / cnt
+        order = list(np.argsort(m)[::-1][:topk])
+        top_names = [pnames[p] for p in order]
+        topk_sets[ct] = set(top_names)
+        per_ct[ct] = {
+            'n_cells': int(cnt),
+            'mean_entropy': float(df.loc[df['cell_type'] == ct, 'entropy'].mean()),
+            f'top{topk}_pathways': top_names,
+            f'top{topk}_attention': [float(m[p]) for p in order],
+        }
+    if per_ct:
+        # Per-cell-type dominant pathways are emitted whenever >=1 type qualifies (a
+        # plan deliverable in its own right). The cross-type Jaccard specificity is
+        # gated separately below, since it is only defined for >=2 types.
+        cts = sorted(per_ct)
+        summary['topk'] = int(topk)
+        summary['min_cells_per_celltype'] = int(min_cells)
+        summary['n_celltypes_analyzed'] = len(cts)
+        summary['per_celltype_dominant'] = per_ct
+        ct_rows = []
+        for ct in cts:
+            d = per_ct[ct]
+            for rank, (pw, at) in enumerate(zip(d[f'top{topk}_pathways'],
+                                                d[f'top{topk}_attention']), 1):
+                ct_rows.append({'cell_type': ct, 'n_cells': d['n_cells'], 'rank': rank,
+                                'pathway': pw, 'mean_attention': at,
+                                'mean_entropy': d['mean_entropy']})
+        pd.DataFrame(ct_rows).to_csv(os.path.join(out_dir, 'attention_by_celltype.csv'),
+                                     index=False)
+        if len(topk_sets) >= 2:
+            dists = []
+            for i in range(len(cts)):
+                for j in range(i + 1, len(cts)):
+                    s1, s2 = topk_sets[cts[i]], topk_sets[cts[j]]
+                    jac = len(s1 & s2) / max(1, len(s1 | s2))
+                    dists.append(1.0 - jac)
+            summary['celltype_specificity_jaccard_distance'] = float(np.mean(dists))
+            print(f"[A] per-cell-type: {len(cts)} types (>= {min_cells} cells) | top-{topk} "
+                  f"Jaccard distance {summary['celltype_specificity_jaccard_distance']:.3f} "
+                  f"(higher => more cell-type-specific pathway focus)")
+        else:
+            print(f"[A] per-cell-type: 1 type (>= {min_cells} cells); dominant pathways "
+                  f"written, but Jaccard specificity needs >= 2 types.")
+    elif cell_types:
+        print(f"[A] per-cell-type skipped: no cell type reached >= {min_cells} cells.")
+    else:
+        print("[A] per-cell-type analysis skipped (no cell types; pass --cell_type_key).")
+
     with open(os.path.join(out_dir, 'A_endogeneity.json'), 'w') as f:
         json.dump(summary, f, indent=2)
     print(f"[A] {len(df)} cells | mean entropy {summary['mean_entropy']:.3f} "
@@ -317,8 +414,64 @@ def analysis_C(model, loader, pathway_names, device, out_dir, gen_steps=50,
     return df
 
 
+def _read_cell_types(adata_path, index, cell_type_key=None):
+    """Return {cell_id -> cell_type(str)} aligned to ``index``, or None.
+
+    Reads only ``adata.obs`` (backed mode, so X is not loaded twice) to support the
+    per-cell-type RQ4-A analysis. If ``--cell_type_key`` is given it is used (and a
+    missing column is a hard error); otherwise a common set of obs column names is
+    auto-detected. Returns None (with a printed note) when no cell-type column is
+    available, so the analysis degrades gracefully to global-only.
+    """
+    try:
+        import anndata as ad
+        try:
+            obs = ad.read_h5ad(adata_path, backed='r').obs.copy()
+        except Exception:
+            obs = ad.read_h5ad(adata_path).obs
+    except Exception as e:
+        print(f"[A] could not read adata.obs for cell types ({e}); "
+              f"per-cell-type analysis skipped.")
+        return None
+    if cell_type_key:
+        if cell_type_key not in obs.columns:
+            raise ValueError(f"--cell_type_key '{cell_type_key}' not in adata.obs "
+                             f"(available: {list(obs.columns)})")
+        key = cell_type_key
+    else:
+        candidates = ['cell_type', 'celltype', 'cell_types', 'Cell_Type', 'CellType',
+                      'cell_type_label', 'annotation', 'annotations', 'cell_annotation',
+                      'leiden', 'louvain', 'cluster', 'clusters', 'predicted_labels']
+        key = next((c for c in candidates if c in obs.columns), None)
+        if key is None:
+            print(f"[A] no cell-type column found in adata.obs (looked for {candidates}; "
+                  f"available: {list(obs.columns)}). Pass --cell_type_key <col> to enable "
+                  f"per-cell-type analysis; running global-only.")
+            return None
+    # Drop NaN / unassigned entries so unlabeled cells fall OUT of the per-cell-type
+    # block instead of forming a spurious 'nan' pseudo-type that would bias the
+    # Jaccard specificity (curated cell-type columns commonly have unassigned cells).
+    _IGNORE = {'', 'nan', 'none', 'na', 'n/a', '<na>', 'unassigned', 'unknown',
+               'unlabeled', 'unlabelled', 'undetermined'}
+    mapping = {}
+    for cid, ct in obs[key].dropna().items():
+        s = str(ct).strip()
+        if s.lower() in _IGNORE:
+            continue
+        mapping[str(cid)] = s
+    out = {str(c): mapping[str(c)] for c in index if str(c) in mapping}
+    if out:
+        print(f"[A] cell types from obs['{key}']: {len(set(out.values()))} types "
+              f"over {len(out)} cells")
+    return out or None
+
+
 def build_loader(args, device):
-    """Minimal single-cell loader mirroring rectified_main's single path."""
+    """Minimal single-cell loader mirroring rectified_main's single path.
+
+    Also returns a {cell_id -> cell_type} map (or None) for the per-cell-type RQ4-A
+    analysis; cell types come from adata.obs (see _read_cell_types).
+    """
     from torchvision import transforms
     from torch.utils.data import DataLoader
     from src.dataset import CellImageGeneDataset
@@ -335,7 +488,9 @@ def build_loader(args, device):
         missing_gene_symbols=missing)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_dataloader_workers)
-    return loader, expr_df.shape[1], list(expr_df.columns)
+    cell_types = _read_cell_types(args.adata, list(expr_df.index),
+                                  cell_type_key=getattr(args, 'cell_type_key', None))
+    return loader, expr_df.shape[1], list(expr_df.columns), cell_types
 
 
 def main():
@@ -356,21 +511,34 @@ def main():
     ap.add_argument('--batch_size', type=int, default=16)
     ap.add_argument('--num_dataloader_workers', type=int, default=2)
     ap.add_argument('--gen_steps', type=int, default=50)
+    ap.add_argument('--cell_type_key', default=None,
+                    help='adata.obs column holding cell type for the per-cell-type '
+                         'RQ4-A analysis. Default: auto-detect common names; if none '
+                         'found, per-cell-type analysis is skipped (global-only).')
+    ap.add_argument('--attn_max_batches', type=int, default=0,
+                    help='Cap on batches for sub-analysis A (0 = all cells; attention '
+                         'is a cheap forward pass).')
+    ap.add_argument('--topk_pathways', type=int, default=5,
+                    help='Top-k dominant pathways per cell type for the Jaccard specificity.')
+    ap.add_argument('--min_cells_per_celltype', type=int, default=10,
+                    help='Cell types with fewer cells are excluded from the specificity metric.')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    loader, gene_dim, gene_names = build_loader(args, device)
-    model, pathway_names, mask = load_model(args.model_path, gene_dim, device)
+    loader, gene_dim, gene_names, cell_types = build_loader(args, device)
+    model, pathway_names, mask = load_model(args.model_path, gene_dim, device, gene_names=gene_names)
     if pathway_names is None:
         pathway_names = [f"pathway_{i}" for i in range(model.rna_encoder.embed.P)]
 
+    _A_kw = dict(cell_types=cell_types, max_batches=(args.attn_max_batches or None),
+                 topk=args.topk_pathways, min_cells=args.min_cells_per_celltype)
     attn_df = None
     pathway_scores = None
     if 'A' in args.analysis:
-        attn_df, _, pathway_scores = analysis_A(model, loader, pathway_names, device, args.out_dir)
+        attn_df, _, pathway_scores = analysis_A(model, loader, pathway_names, device, args.out_dir, **_A_kw)
     if 'B' in args.analysis:
         if pathway_scores is None:
-            attn_df, _, pathway_scores = analysis_A(model, loader, pathway_names, device, args.out_dir)
+            attn_df, _, pathway_scores = analysis_A(model, loader, pathway_names, device, args.out_dir, **_A_kw)
         marker = None
         if args.reference_pathways and os.path.exists(args.reference_pathways):
             with open(args.reference_pathways) as f:

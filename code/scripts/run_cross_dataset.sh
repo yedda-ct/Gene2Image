@@ -26,7 +26,7 @@ DATA_ROOT=${DATA_ROOT:-data/processed_data}
 MASK_DIR=${MASK_DIR:-data/pathway_masks}
 OUT_ROOT=${OUT_ROOT:-results/cross_dataset}
 BATCH_SIZE=${BATCH_SIZE:-16}
-EPOCHS=${EPOCHS:-100}
+EPOCHS=${EPOCHS:-50}          # 对齐 GeneFlow 源代码 train.sh(EPOCHS=50)
 GEN_STEPS=${GEN_STEPS:-100}
 WORKERS=${WORKERS:-4}
 EXTRA=${EXTRA:-"--use_amp"}
@@ -62,32 +62,37 @@ run_pair() {
       --src_name "$src" --tgt_name "$tgt" --out_dir "$MASK_DIR"
   fi
 
-  echo "=== TRAIN Gene2Image on $src (seed=$seed) ==="
-  $PY rectified/rectified_main.py \
-    --model_type single --img_size 256 --img_channels 4 \
-    --adata "$src_adata" --image_paths "$src_img" \
-    --output_dir "$out" \
-    --encoder_type pathway --pathway_mask "$src_mask" \
-    --batch_size "$BATCH_SIZE" --epochs "$EPOCHS" --gen_steps "$GEN_STEPS" \
-    --num_dataloader_workers "$WORKERS" --seed "$seed" $EXTRA
+  # TRAIN=0 → eval-only job (reads existing checkpoint); EVAL=0 → train-only job.
+  if [ "${TRAIN:-1}" = "1" ]; then
+    echo "=== TRAIN Gene2Image on $src (seed=$seed) ==="
+    $PY rectified/rectified_main.py \
+      --model_type single --img_size 256 --img_channels 4 \
+      --adata "$src_adata" --image_paths "$src_img" \
+      --output_dir "$out" \
+      --encoder_type pathway --pathway_mask "$src_mask" \
+      --batch_size "$BATCH_SIZE" --epochs "$EPOCHS" --gen_steps "$GEN_STEPS" \
+      --num_dataloader_workers "$WORKERS" --seed "$seed" $EXTRA
+  fi
 
-  echo "=== EVAL on TARGET $tgt (cross-panel) ==="
-  $PY rectified/rectified_evaluate.py \
-    --model_path "$out/checkpoints/best_checkpoint.pt" \
-    --model_type single --img_size 256 --img_channels 4 \
-    --adata "$tgt_adata" --image_paths "$tgt_img" \
-    --output_dir "$out/eval_on_${tgt}" \
-    --encoder_type pathway --pathway_mask "$tgt_mask" --cross_dataset_eval \
-    --batch_size 8 --seed "$seed" --gen_steps "$GEN_STEPS" $EVAL_EXTRA
+  if [ "${EVAL:-1}" = "1" ]; then
+    echo "=== EVAL on TARGET $tgt (cross-panel) ==="
+    $PY rectified/rectified_evaluate.py \
+      --model_path "$out/checkpoints/best_checkpoint.pt" \
+      --model_type single --img_size 256 --img_channels 4 \
+      --adata "$tgt_adata" --image_paths "$tgt_img" \
+      --output_dir "$out/eval_on_${tgt}" \
+      --encoder_type pathway --pathway_mask "$tgt_mask" --cross_dataset_eval \
+      --batch_size 8 --seed "$seed" --gen_steps "$GEN_STEPS" $EVAL_EXTRA
 
-  echo "=== EVAL on SOURCE $src (same-panel reference for degradation rate) ==="
-  $PY rectified/rectified_evaluate.py \
-    --model_path "$out/checkpoints/best_checkpoint.pt" \
-    --model_type single --img_size 256 --img_channels 4 \
-    --adata "$src_adata" --image_paths "$src_img" \
-    --output_dir "$out/eval_on_${src}" \
-    --encoder_type pathway --pathway_mask "$src_mask" \
-    --batch_size 8 --seed "$seed" --gen_steps "$GEN_STEPS" $EVAL_EXTRA
+    echo "=== EVAL on SOURCE $src (same-panel reference for degradation rate) ==="
+    $PY rectified/rectified_evaluate.py \
+      --model_path "$out/checkpoints/best_checkpoint.pt" \
+      --model_type single --img_size 256 --img_channels 4 \
+      --adata "$src_adata" --image_paths "$src_img" \
+      --output_dir "$out/eval_on_${src}" \
+      --encoder_type pathway --pathway_mask "$src_mask" \
+      --batch_size 8 --seed "$seed" --gen_steps "$GEN_STEPS" $EVAL_EXTRA
+  fi
 }
 
 if [ "$1" = "all" ]; then

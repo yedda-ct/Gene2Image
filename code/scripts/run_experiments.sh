@@ -29,7 +29,7 @@ MASK_DIR=${MASK_DIR:-data/pathway_masks}
 OUT_ROOT=${OUT_ROOT:-results}
 DB=${DB:-hallmark}
 BATCH_SIZE=${BATCH_SIZE:-16}
-EPOCHS=${EPOCHS:-100}
+EPOCHS=${EPOCHS:-50}          # 对齐 GeneFlow 源代码 train.sh(EPOCHS=50)
 GEN_STEPS=${GEN_STEPS:-100}
 WORKERS=${WORKERS:-4}
 EXTRA=${EXTRA:-"--use_amp"}
@@ -68,7 +68,15 @@ run_one() {
   case "$variant" in
     gene2image) enc_args="--encoder_type pathway --pathway_mask $MASK_DIR/${ds}_${DB}_real.npz" ;;
     geneflow)   enc_args="--encoder_type rna" ;;
-    randpath)   enc_args="--encoder_type pathway --pathway_mask $MASK_DIR/${ds}_${DB}_rand.npz" ;;
+    randpath)
+      # Per-seed random mask so RQ2's 3-seed std includes random-mask draw variance;
+      # fall back to the shared rand mask (with a note) if the per-seed one is absent.
+      local rmask="$MASK_DIR/${ds}_${DB}_rand_s${seed}.npz"
+      if [ ! -f "$rmask" ]; then
+        rmask="$MASK_DIR/${ds}_${DB}_rand.npz"
+        echo "  (randpath: per-seed rand mask ${ds}_${DB}_rand_s${seed}.npz absent; using shared $rmask)"
+      fi
+      enc_args="--encoder_type pathway --pathway_mask $rmask" ;;
     pathprior)  enc_args="--encoder_type pathway --pathway_mask $MASK_DIR/${ds}_${DB}_real.npz --no_learnable_pathway" ;;
     notrans)    enc_args="--encoder_type pathway --pathway_mask $MASK_DIR/${ds}_${DB}_real.npz --no_pathway_transformer" ;;
     nomask)     enc_args="--encoder_type pathway --pathway_mask $MASK_DIR/${ds}_${DB}_none.npz" ;;
@@ -77,14 +85,17 @@ run_one() {
     *) echo "Unknown variant: $variant"; exit 1 ;;
   esac
 
-  echo "=== TRAIN $variant | $ds | seed=$seed -> $out ==="
-  $PY rectified/rectified_main.py \
-    --model_type single --img_size 256 --img_channels 4 \
-    --adata "$adata" --image_paths "$imgpaths" \
-    --output_dir "$out" \
-    --batch_size "$BATCH_SIZE" --epochs "$EPOCHS" --gen_steps "$GEN_STEPS" \
-    --num_dataloader_workers "$WORKERS" --seed "$seed" \
-    --pathway_db "$DB" $enc_args $EXTRA "$@"
+  # TRAIN=0 skips training (eval-only job: reads the existing checkpoint). Default trains.
+  if [ "${TRAIN:-1}" = "1" ]; then
+    echo "=== TRAIN $variant | $ds | seed=$seed -> $out ==="
+    $PY rectified/rectified_main.py \
+      --model_type single --img_size 256 --img_channels 4 \
+      --adata "$adata" --image_paths "$imgpaths" \
+      --output_dir "$out" \
+      --batch_size "$BATCH_SIZE" --epochs "$EPOCHS" --gen_steps "$GEN_STEPS" \
+      --num_dataloader_workers "$WORKERS" --seed "$seed" \
+      --pathway_db "$DB" $enc_args $EXTRA "$@"
+  fi
 
   # A "run" = train + evaluate, so each invocation produces evaluation_summary.json
   # in its own run dir (picked up by summarize_results.py). Set EVAL=0 to skip eval.

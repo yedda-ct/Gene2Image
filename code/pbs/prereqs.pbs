@@ -1,0 +1,78 @@
+#!/bin/bash
+# =============================================================================
+# Gene2Image — PHASE 0 前置：构建通路掩码 + 修图像路径。**必须在所有训练作业之前跑完一次。**
+# 产出：data/pathway_masks/{ds}_hallmark_{real,rand,none}.npz + 每 seed 的 rand_s{seed}.npz
+#       + 跨数据集掩码 {src}_to_{tgt}_{src,tgt}.npz；以及 C2/P1 的 cell_image_paths_local.json。
+# 只读 adata（+ gseapy 联网或离线 GMT），不占 GPU；给 CPU 队列即可。
+#   qsub -v SEEDS="42 43 44" pbs/prereqs.pbs
+# =============================================================================
+#PBS -N g2i_prereqs
+#PBS -l select=1:ncpus=8:mem=64gb
+#PBS -l walltime=04:00:00
+#PBS -j oe
+#PBS -o logs/
+### #PBS -q cpu        # ★ 无 GPU;按需改队列/账户
+### #PBS -P CHANGEME_project
+
+set -euo pipefail
+PROJECT_DIR="${PROJECT_DIR:-$PBS_O_WORKDIR}"
+VENV_DIR="${VENV_DIR:?}"; RELEASE_MODULE="${RELEASE_MODULE:?}"; PYTORCH_MODULE="${PYTORCH_MODULE:?}"
+DATA_ROOT="${DATA_DIR:-$PROJECT_DIR/data/processed_data}"
+MASK_DIR="${MASK_DIR:-$PROJECT_DIR/data/pathway_masks}"
+GMT_HALLMARK="${GMT_HALLMARK:-}"; GMT_REACTOME="${GMT_REACTOME:-}"
+# DATASETS/SEEDS may arrive underscore-encoded from qsub -v (PBS -v can't carry spaces).
+DATASETS="${DATASETS:-c1 c2 p1}"; DATASETS="${DATASETS//_/ }"
+SEEDS="${SEEDS:-42 43 44}"; SEEDS="${SEEDS//_/ }"
+INCLUDE_CROSS="${INCLUDE_CROSS:-1}"; INCLUDE_REACTOME="${INCLUDE_REACTOME:-0}"
+
+cd "${PROJECT_DIR}"; mkdir -p logs "$MASK_DIR"
+module purge; module load "${RELEASE_MODULE}" "${PYTORCH_MODULE}"
+# shellcheck disable=SC1091
+source "${VENV_DIR}/bin/activate"
+export PYTHONHASHSEED=0
+
+folder_of(){ case "$1" in
+  c1) echo Xenium_V1_hSkin_Melanoma_Base_FFPE;;
+  c2) echo Xeniumranger_V1_hSkin_Melanoma_Add_on_FFPE;;
+  p1) echo Xenium_Prime_Human_Skin_FFPE;; esac; }
+adata_of(){ echo "$DATA_ROOT/$(folder_of "$1")/adata.h5ad"; }
+img_of(){   echo "$DATA_ROOT/$(folder_of "$1")/cell_patch_256_aux/input/cell_image_paths_local.json"; }
+raw_of(){   echo "$DATA_ROOT/$(folder_of "$1")/cell_patch_256_aux/input/cell_image_paths.json"; }
+gmt_hallmark(){ [ -n "$GMT_HALLMARK" ] && echo "--gmt \"$GMT_HALLMARK\""; }
+
+# 数据集需求 = 请求的 + 跨数据集端点（c1 c2 p1）
+NEED="$DATASETS"; [ "$INCLUDE_CROSS" = "1" ] && NEED="$NEED c1 c2 p1"
+NEED=$(echo "$NEED" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+
+for ds in $NEED; do
+  echo "=== prereq: $ds ==="
+  img=$(img_of "$ds")
+  [ -f "$img" ] || eval python scripts/fix_image_paths.py --json "\"$(raw_of "$ds")\"" --local_root "\"$DATA_ROOT\""
+  # 掩码：real/rand/none + 每 seed 的 rand_s{seed}（--rand_seeds）。齐了就跳过。
+  need=""
+  for v in real rand none; do [ ! -f "$MASK_DIR/${ds}_hallmark_${v}.npz" ] && need=1; done
+  for s in $SEEDS; do [ ! -f "$MASK_DIR/${ds}_hallmark_rand_s${s}.npz" ] && need=1; done
+  if [ -n "$need" ]; then
+    eval python scripts/build_pathway_mask.py --adata "\"$(adata_of "$ds")\"" --prefix "$ds" \
+      --db hallmark $(gmt_hallmark) --out_dir "\"$MASK_DIR\"" --seed 42 --rand_seeds $SEEDS
+  else echo "  掩码已齐,跳过。"; fi
+done
+
+# 可选 Hallmark+Reactome（P1 附加消融）
+if [ "$INCLUDE_REACTOME" = "1" ] && [ ! -f "$MASK_DIR/p1_hallmark_reactome_real.npz" ]; then
+  gmt_hr=""
+  if [ -n "$GMT_HALLMARK" ] && [ -n "$GMT_REACTOME" ]; then gmt_hr="--gmt \"$GMT_HALLMARK\" \"$GMT_REACTOME\""; fi
+  eval python scripts/build_pathway_mask.py --adata "\"$(adata_of p1)\"" --prefix p1 \
+    --db hallmark_reactome $gmt_hr --out_dir "\"$MASK_DIR\"" --seed 42 --rand_seeds $SEEDS
+fi
+
+# 跨数据集掩码（通路名对齐）
+if [ "$INCLUDE_CROSS" = "1" ]; then
+  for pair in "c1 c2" "c2 c1" "c1 p1"; do
+    set -- $pair; src=$1; tgt=$2
+    [ -f "$MASK_DIR/${src}_to_${tgt}_src.npz" ] || \
+      python scripts/build_cross_masks.py --src "$MASK_DIR/${src}_hallmark_real.npz" \
+        --tgt "$MASK_DIR/${tgt}_hallmark_real.npz" --src_name "$src" --tgt_name "$tgt" --out_dir "$MASK_DIR"
+  done
+fi
+echo "=== prereqs 完成。掩码清单 ==="; ls -1 "$MASK_DIR" | sed 's/^/  /'

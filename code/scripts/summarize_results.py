@@ -89,14 +89,47 @@ def collect(results_root):
     return pd.DataFrame(rows)
 
 
-def aggregate(df):
-    """Mean +/- std across seeds for each (variant, dataset)."""
+def aggregate(df, expected_seeds=None):
+    """Mean +/- std across seeds for each (variant, dataset).
+
+    Also emits an ``n_seeds`` column (runs contributing to each group) plus a
+    per-metric ``<metric>_n`` count, and prints a LOUD warning for any group with
+    fewer runs than expected (default: the max observed across groups) or any
+    metric with missing/NaN values. Without this, a crashed or NaN seed is silently
+    dropped and the group's mean/std is formatted identically to a full multi-seed
+    result -- so a 2-seed arm could be compared against a 3-seed arm unnoticed.
+    """
     if df.empty:
         return df
     present = [m for m in METRIC_KEYS.values() if m in df.columns]
-    g = df.groupby(['variant', 'dataset'])[present].agg(['mean', 'std'])
+    grp = df.groupby(['variant', 'dataset'])
+    g = grp[present].agg(['mean', 'std'])
     g.columns = [f'{m}_{stat}' for m, stat in g.columns]
-    return g.reset_index()
+    g = g.reset_index()
+    # runs per group, and non-NaN contributing count per metric
+    g = g.merge(grp.size().reset_index(name='n_seeds'), on=['variant', 'dataset'])
+    g = g.merge(grp[present].count().reset_index().rename(
+        columns={m: f'{m}_n' for m in present}), on=['variant', 'dataset'])
+
+    exp = int(expected_seeds) if expected_seeds is not None else int(g['n_seeds'].max())
+    problems = []
+    for _, row in g.iterrows():
+        vd = f"{row['variant']}/{row['dataset']}"
+        if int(row['n_seeds']) < exp:
+            problems.append(f"  {vd}: only {int(row['n_seeds'])}/{exp} seed run(s)")
+        for m in present:
+            if int(row[f'{m}_n']) < int(row['n_seeds']):
+                problems.append(f"  {vd}: metric {m} present for "
+                                f"{int(row[f'{m}_n'])}/{int(row['n_seeds'])} run(s)")
+    if problems:
+        print("=" * 72)
+        print(f"WARNING: INCOMPLETE AGGREGATES (expected {exp} seed(s) per group).")
+        print("These rows are means over FEWER runs than expected -- do NOT compare")
+        print("them as if they were complete multi-seed results:")
+        for p in problems:
+            print(p)
+        print("=" * 72)
+    return g
 
 
 def collect_cross(results_root):
@@ -154,6 +187,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--results_root', default='results')
     ap.add_argument('--out_dir', default='results')
+    ap.add_argument('--expected_seeds', type=int, default=None,
+                    help='Expected #seeds per (variant,dataset); warn if any group has '
+                         'fewer. Defaults to the max observed across groups.')
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -163,7 +199,7 @@ def main():
         print(f"No main evaluation_summary.json found under {args.results_root}.")
     else:
         print(f"Collected {len(df)} main eval runs.")
-        summary = aggregate(df)
+        summary = aggregate(df, expected_seeds=args.expected_seeds)
         main_path = os.path.join(args.out_dir, 'summary_main.csv')
         summary.to_csv(main_path, index=False)
         print(f"wrote {main_path} ({len(summary)} variant x dataset rows)")

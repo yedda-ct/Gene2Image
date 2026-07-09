@@ -25,7 +25,7 @@
 #
 # COMMON KNOBS (env vars, with defaults):
 #   DATASETS="c1 c2 p1"  VARIANTS="gene2image geneflow randpath pathprior notrans nomask"
-#   SEEDS="42 43 44"     EPOCHS=100  BATCH_SIZE=16  EVAL_BATCH=8  GEN_STEPS=100  WORKERS=4
+#   SEEDS="42 43 44"     EPOCHS=50   BATCH_SIZE=16  EVAL_BATCH=8  GEN_STEPS=100  WORKERS=4
 #   INCLUDE_CROSS=1  INCLUDE_INTERPRET=1  INCLUDE_REACTOME=0  INTERPRET_SEED=42
 #   DATA_ROOT=data/processed_data  MASK_DIR=data/pathway_masks  OUT_ROOT=results
 #   EXTRA="--use_amp"   PY=python
@@ -65,7 +65,7 @@ DB=${DB:-hallmark}
 #   GMT_HALLMARK=/path/h.all.*.gmt  GMT_REACTOME=/path/c2.cp.reactome.*.gmt
 GMT_HALLMARK=${GMT_HALLMARK:-}
 GMT_REACTOME=${GMT_REACTOME:-}
-EPOCHS=${EPOCHS:-100}
+EPOCHS=${EPOCHS:-50}          # 对齐 GeneFlow 源代码 train.sh(EPOCHS=50)
 BATCH_SIZE=${BATCH_SIZE:-16}
 EVAL_BATCH=${EVAL_BATCH:-8}
 GEN_STEPS=${GEN_STEPS:-100}
@@ -84,6 +84,18 @@ INCLUDE_INTERPRET=${INCLUDE_INTERPRET:-1}
 INCLUDE_REACTOME=${INCLUDE_REACTOME:-0}
 INTERPRET_SEED=${INTERPRET_SEED:-42}
 DRY_RUN=${DRY_RUN:-0}
+
+# RQ4 interpret runs on a SINGLE seed's checkpoint (INTERPRET_SEED). If that seed
+# is not in SEEDS, its checkpoint is never trained and interpret would silently
+# produce nothing; fall back to the first trained seed instead.
+if [ -n "${SEEDS// /}" ]; then
+  case " $SEEDS " in
+    *" $INTERPRET_SEED "*) ;;
+    *) read -r _first_seed _ <<< "$SEEDS"   # whitespace-robust first token (leading spaces safe)
+       echo "  NOTE: INTERPRET_SEED=$INTERPRET_SEED not in SEEDS='$SEEDS'; using seed $_first_seed for RQ4 interpret."
+       INTERPRET_SEED=$_first_seed ;;
+  esac
+fi
 
 # GPU pool: explicit GPUS env wins; else 0..MAX_PARALLEL-1.
 if [ -n "${GPUS// /}" ]; then            # non-empty after stripping whitespace
@@ -150,9 +162,12 @@ prep_dataset() {
   # (interrupted, or rand/none deleted) would otherwise crash randpath/nomask jobs.
   local need=""
   for v in real rand none; do [ ! -f "$MASK_DIR/${ds}_hallmark_${v}.npz" ] && need=1; done
+  # randPath uses a per-seed random mask (so its multi-seed std reflects mask-draw
+  # variance, not just optimization noise); rebuild if any per-seed rand mask is missing.
+  for s in $SEEDS; do [ ! -f "$MASK_DIR/${ds}_hallmark_rand_s${s}.npz" ] && need=1; done
   gmt=$(gmt_args hallmark) || return 1
   [ -n "$need" ] && \
-    runcmd "$PY scripts/build_pathway_mask.py --adata \"$adata\" --prefix $ds --db hallmark $gmt --out_dir \"$MASK_DIR\" --seed 42"
+    runcmd "$PY scripts/build_pathway_mask.py --adata \"$adata\" --prefix $ds --db hallmark $gmt --out_dir \"$MASK_DIR\" --seed 42 --rand_seeds $SEEDS"
   return 0
 }
 build_cross_masks() {
@@ -314,6 +329,9 @@ build_interpret_jobs() {
     local ckpt="$OUT_ROOT/gene2image_${ds}_seed${INTERPRET_SEED}/checkpoints/best_checkpoint.pt"
     local gfimp="$OUT_ROOT/geneflow_${ds}_seed${INTERPRET_SEED}/gene_importance_scores.csv"
     local cmd="$PY analysis/pathway_interpret.py --model_path \"$ckpt\" --adata \"$(adata_of "$ds")\" --image_paths \"$(imgpaths_of "$ds")\" --out_dir \"$OUT_ROOT/interpret/${ds}\" --geneflow_importance \"$gfimp\" --gen_steps $GEN_STEPS"
+    # Optional: name the adata.obs cell-type column for the per-cell-type RQ4-A
+    # analysis (else auto-detected). e.g. CELL_TYPE_KEY=cell_type bash scripts/run_all.sh
+    [ -n "${CELL_TYPE_KEY:-}" ] && cmd="$cmd --cell_type_key \"$CELL_TYPE_KEY\""
     INTERPRET_JOBS+=("interpret_${ds}"$'\t'"$cmd")
   done
 }

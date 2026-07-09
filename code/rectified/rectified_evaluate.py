@@ -43,10 +43,20 @@ from src.dataset import (
 # from rectified.rectified_train_ddp import generate_images_with_rectified_flow
 from src.stain_normalization import normalize_staining_rgb_skimage_hist_match
 from rectified.utils import generate_images_with_rectified_flow
-from rectified.utils_uni2h import (
-    load_uni2_h_model, extract_uni2_h_embeddings, extended_biological_evaluation_uni2h,
-    calculate_uni2h_fid
-)
+# UNI2-h is an OPTIONAL pathology-FM metric. Its module pulls heavy deps (cv2, timm,
+# sklearn); guard the import so a missing dep degrades UNI2-h FID to N/A instead of
+# crashing the whole evaluation (basic FID/SSIM/PSNR are unaffected). Downstream calls
+# are already gated on `uni2h_model is not None`.
+try:
+    from rectified.utils_uni2h import (
+        load_uni2_h_model, extract_uni2_h_embeddings, extended_biological_evaluation_uni2h,
+        calculate_uni2h_fid
+    )
+except Exception as _uni2h_import_err:
+    load_uni2_h_model = extract_uni2_h_embeddings = extended_biological_evaluation_uni2h = calculate_uni2h_fid = None
+    logging.getLogger(__name__).warning(
+        f"UNI2-h eval unavailable (import failed: {_uni2h_import_err}); "
+        f"UNI2-h metrics -> N/A. Basic FID/SSIM/PSNR unaffected.")
 from rectified.utils_he2rna import *
 from rectified.utils_plot import save_all_evaluation_plots
 
@@ -329,7 +339,10 @@ def main():
     np.random.seed(args.seed + rank)
 
     # Load UNI2-h model for biological validation and FID calculation
-    uni2h_model, uni2h_processor, uni2h_preprocess = load_uni2_h_model(device)
+    if load_uni2_h_model is not None:
+        uni2h_model, uni2h_processor, uni2h_preprocess = load_uni2_h_model(device)
+    else:  # import guarded above (optional dep missing) -> UNI2-h path skipped
+        uni2h_model = uni2h_processor = uni2h_preprocess = None
     if rank == 0:
         if uni2h_model is not None:  # ← Check model, not processor
             logger.info("UNI2-h model loaded successfully for biological validation")
@@ -674,6 +687,14 @@ def main():
     except Exception as e:
         if cross_eval:
             # Do not silently fall back to a same-panel load for cross-dataset eval.
+            raise
+        if encoder_type == 'pathway':
+            # Never fall back to the RNA constructors for a pathway (Gene2Image /
+            # ablation) checkpoint. The feature-detection path below only builds RNA
+            # encoders, so strict=False would drop every pathway weight and silently
+            # evaluate a RANDOM-init encoder, reporting garbage metrics under the
+            # variant's name (multi-cell) or aborting with no metrics (single-cell).
+            # Fail loudly so the real load error surfaces.
             raise
         if rank == 0:
             logger.warning(f"Failed to load model with current constructor: {e}")

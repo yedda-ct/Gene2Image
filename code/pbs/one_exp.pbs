@@ -1,0 +1,109 @@
+#!/bin/bash
+# =============================================================================
+# Gene2Image — 单个实验作业（1×H100 跑 1 个 train+eval）。PBS 版（对应 slurm/one_exp.slurm）。
+#
+# 三种工作单元（用环境变量选一种,submit_all.sh 会自动传）：
+#   主/消融：  KIND=exp       VARIANT=<gene2image|geneflow|randpath|pathprior|notrans|nomask> DS=<c1|c2|p1> SEED=<n>
+#   跨数据集： KIND=cross     SRC=<..> TGT=<..> SEED=<n>
+#   可解释性： KIND=interpret DS=<c1|c2|p1>          （读已训好的 gene2image ckpt）
+#
+# 手动提的例子（walltime 按数据集：c1/c2=12h,p1/cross=36h,interpret=4h）：
+#   qsub -N g2i_notrans_p1_s44 -l walltime=36:00:00 \
+#     -v KIND=exp,VARIANT=notrans,DS=p1,SEED=44 pbs/one_exp.pbs
+#
+# ⚠️ 默认不幂等：会【覆盖】同名 run 目录。submit_all.sh 会自动跳过“目录已存在”的。
+#    若 walltime 可能被打断,设 AUTO_RESUME=1（会加 --auto_resume 从最新 checkpoint 续训）。
+# =============================================================================
+#PBS -N g2i_one
+#PBS -l select=1:ncpus=8:ngpus=1:mem=120gb
+#PBS -l walltime=36:00:00
+#PBS -j oe
+#PBS -o logs/
+### ★ 站点相关（按需在 qsub 时用 -q / -P/-A 覆盖,或解开下面两行改成你的队列/账户）：
+### #PBS -q gpu
+### #PBS -P CHANGEME_project     # PBS Pro 用 -P；Torque/OpenPBS 用 -A CHANGEME_account
+
+set -euo pipefail
+
+# ╔══ ★ 站点变量：与 setup_env.sh 一致；submit_all.sh 会用 -v 透传,这里给默认 ══╗
+PROJECT_DIR="${PROJECT_DIR:-$PBS_O_WORKDIR}"        # 仓库 code/ 目录（含 scripts/ rectified/ src/）
+VENV_DIR="${VENV_DIR:?必须设置 VENV_DIR（见 setup_env.sh）}"
+RELEASE_MODULE="${RELEASE_MODULE:?必须设置 RELEASE_MODULE}"
+PYTORCH_MODULE="${PYTORCH_MODULE:?必须设置 PYTORCH_MODULE}"
+GMT_HALLMARK="${GMT_HALLMARK:-}"; GMT_REACTOME="${GMT_REACTOME:-}"
+DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data/processed_data}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/results}"    # ★ 所有作业必须一致
+INTERPRET_SEED="${INTERPRET_SEED:-42}"
+# ────────────────────────────────────────────────────────────────────────────
+: "${KIND:?必须设置 KIND=exp|cross|interpret}"
+
+cd "${PROJECT_DIR}"; mkdir -p logs
+module purge
+module load "${RELEASE_MODULE}" "${PYTORCH_MODULE}"
+# shellcheck disable=SC1091
+source "${VENV_DIR}/bin/activate"
+
+echo "=== one_exp KIND=${KIND} host=$(hostname) jobid=${PBS_JOBID:-NA} date=$(date) ==="
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
+python -c "import torch;print('torch',torch.__version__,'cuda?',torch.cuda.is_available(),'n_gpu',torch.cuda.device_count())"
+
+export PYTHONHASHSEED=0                 # 划分确定性（train/eval 同划分）
+export GMT_HALLMARK GMT_REACTOME
+export DATA_ROOT="${DATA_DIR}"
+export MASK_DIR="${MASK_DIR:-$PROJECT_DIR/data/pathway_masks}"
+export OUT_ROOT="${OUTPUT_DIR}" DB="${DB:-hallmark}"
+# H100 超参：batch 默认 16（对齐 GeneFlow/规划,可比性最好）。H100 80G 有余量,如愿提速可
+# 设 BATCH_SIZE=32（属改优化动力学的选择,先冒烟测显存；P1/nomask 最紧）。WORKERS=8。
+export EPOCHS="${EPOCHS:-50}" BATCH_SIZE="${BATCH_SIZE:-16}" EVAL_BATCH="${EVAL_BATCH:-16}" \
+       GEN_STEPS="${GEN_STEPS:-100}" WORKERS="${WORKERS:-8}"
+# walltime 可能被打断时设 AUTO_RESUME=1 → 从最新 checkpoint 续训。
+export EXTRA="${EXTRA:---use_amp}"
+[ "${AUTO_RESUME:-0}" = "1" ] && export EXTRA="${EXTRA} --auto_resume"
+
+dataset_dir() { case "$1" in
+  c1) echo "Xenium_V1_hSkin_Melanoma_Base_FFPE";;
+  c2) echo "Xeniumranger_V1_hSkin_Melanoma_Add_on_FFPE";;
+  p1) echo "Xenium_Prime_Human_Skin_FFPE";; esac; }
+
+case "${KIND}" in
+  train|eval)   # 细粒度：train 只训练(存 checkpoint)，eval 只评估(读 checkpoint 出 summary)
+    : "${VARIANT:?需要 VARIANT}"; : "${DS:?需要 DS}"; : "${SEED:?需要 SEED}"
+    if [ "${KIND}" = train ]; then _tr=1; _ev=0; else _tr=0; _ev=1; fi
+    echo "=== ${KIND}：${VARIANT} ${DS} seed=${SEED} (TRAIN=$_tr EVAL=$_ev batch=${BATCH_SIZE}) ==="
+    TRAIN=$_tr EVAL=$_ev bash scripts/run_experiments.sh "${VARIANT}" "${DS}" "${SEED}"
+    ;;
+  exp)          # 合并：train+eval 一个作业(手动/向后兼容)
+    : "${VARIANT:?KIND=exp 需要 VARIANT}"; : "${DS:?需要 DS}"; : "${SEED:?需要 SEED}"
+    echo "=== exp（train+eval）：${VARIANT} ${DS} seed=${SEED} (batch=${BATCH_SIZE}) ==="
+    bash scripts/run_experiments.sh "${VARIANT}" "${DS}" "${SEED}"
+    ;;
+  cross_train|cross_eval)   # 跨数据集的细粒度拆分
+    : "${SRC:?需要 SRC}"; : "${TGT:?需要 TGT}"; : "${SEED:?需要 SEED}"
+    if [ "${KIND}" = cross_train ]; then _tr=1; _ev=0; else _tr=0; _ev=1; fi
+    echo "=== ${KIND}：${SRC}->${TGT} seed=${SEED} (TRAIN=$_tr EVAL=$_ev) ==="
+    TRAIN=$_tr EVAL=$_ev OUT_ROOT="${OUTPUT_DIR}/cross_dataset" bash scripts/run_cross_dataset.sh "${SRC}" "${TGT}" "${SEED}"
+    ;;
+  cross)        # 合并：train+eval 一个作业
+    : "${SRC:?KIND=cross 需要 SRC}"; : "${TGT:?需要 TGT}"; : "${SEED:?需要 SEED}"
+    echo "=== cross（train+eval）：${SRC}->${TGT} seed=${SEED} ==="
+    OUT_ROOT="${OUTPUT_DIR}/cross_dataset" bash scripts/run_cross_dataset.sh "${SRC}" "${TGT}" "${SEED}"
+    ;;
+  interpret)
+    : "${DS:?KIND=interpret 需要 DS}"
+    folder=$(dataset_dir "${DS}")
+    ck="${OUTPUT_DIR}/gene2image_${DS}_seed${INTERPRET_SEED}/checkpoints/best_checkpoint.pt"
+    [ -f "$ck" ] || { echo "ERROR: 缺 ${ck} —— 先跑完 gene2image_${DS}_seed${INTERPRET_SEED} 再 interpret。" >&2; exit 1; }
+    gf="${OUTPUT_DIR}/geneflow_${DS}_seed${INTERPRET_SEED}/gene_importance_scores.csv"
+    gfarg=""; [ -f "$gf" ] && gfarg="--geneflow_importance $gf" || \
+      echo "  注意：$gf 不存在 → 子分析 B(GSEA一致性) 跳过（不影响 A/C）。"
+    ctarg=""; [ -n "${CELL_TYPE_KEY:-}" ] && ctarg="--cell_type_key ${CELL_TYPE_KEY}"
+    echo "=== interpret：${DS} ==="
+    python analysis/pathway_interpret.py \
+      --model_path "$ck" \
+      --adata "${DATA_DIR}/${folder}/adata.h5ad" \
+      --image_paths "${DATA_DIR}/${folder}/cell_patch_256_aux/input/cell_image_paths_local.json" \
+      --out_dir "${OUTPUT_DIR}/interpret/${DS}" $gfarg $ctarg --gen_steps "${GEN_STEPS:-100}"
+    ;;
+  *) echo "ERROR: KIND 必须是 train|eval|exp|cross_train|cross_eval|cross|interpret（当前=${KIND}）" >&2; exit 1 ;;
+esac
+echo "=== one_exp 完成 date=$(date) ==="

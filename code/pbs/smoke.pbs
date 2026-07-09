@@ -1,0 +1,51 @@
+#!/bin/bash
+# =============================================================================
+# Gene2Image — 冒烟测（1×H100,~1-2h）。开跑全量前【必做】,验证运行时链路 + 校准时间。
+# 做三件事：① 建 c1/p1 掩码 ② nomask@p1 显存(1 epoch,防全量时 OOM) ③ gene2image@c1 全链路
+# (1 epoch → checkpoint → eval)。记下 c1 的 1-epoch 墙钟 = 全量时长的标尺。
+#   qsub -v VENV_DIR=...,RELEASE_MODULE=...,PYTORCH_MODULE=... pbs/smoke.pbs
+# =============================================================================
+#PBS -N g2i_smoke
+#PBS -l select=1:ncpus=8:ngpus=1:mem=120gb
+#PBS -l walltime=03:00:00
+#PBS -j oe
+#PBS -o logs/
+### #PBS -q gpu
+### #PBS -P CHANGEME_project
+
+set -euo pipefail
+PROJECT_DIR="${PROJECT_DIR:-$PBS_O_WORKDIR}"
+VENV_DIR="${VENV_DIR:?}"; RELEASE_MODULE="${RELEASE_MODULE:?}"; PYTORCH_MODULE="${PYTORCH_MODULE:?}"
+export DATA_ROOT="${DATA_DIR:-$PROJECT_DIR/data/processed_data}"
+export MASK_DIR="${MASK_DIR:-$PROJECT_DIR/data/pathway_masks}"
+export OUT_ROOT="${OUTPUT_DIR:-$PROJECT_DIR/results_smoke}"   # 冒烟产物单独放,别污染正式 results
+export GMT_HALLMARK="${GMT_HALLMARK:-}"
+cd "$PROJECT_DIR"; mkdir -p logs "$MASK_DIR"
+module purge; module load "$RELEASE_MODULE" "$PYTORCH_MODULE"
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+export PYTHONHASHSEED=0
+python -c "import torch;print('torch',torch.__version__,'cuda?',torch.cuda.is_available())"
+
+gmt(){ [ -n "$GMT_HALLMARK" ] && echo "--gmt \"$GMT_HALLMARK\""; }
+adata(){ case "$1" in c1) f=Xenium_V1_hSkin_Melanoma_Base_FFPE;; p1) f=Xenium_Prime_Human_Skin_FFPE;; esac
+         echo "$DATA_ROOT/$f/adata.h5ad"; }
+
+echo "=== [1/3] build c1 & p1 hallmark masks (real/rand/none + rand_s42) ==="
+for ds in c1 p1; do
+  [ -f "$MASK_DIR/${ds}_hallmark_rand_s42.npz" ] || \
+    eval python scripts/build_pathway_mask.py --adata "\"$(adata "$ds")\"" --prefix "$ds" \
+      --db hallmark $(gmt) --out_dir "\"$MASK_DIR\"" --seed 42 --rand_seeds 42
+done
+
+echo "=== [2/3] nomask @ p1 显存冒烟 (1 epoch, no eval) ==="
+EPOCHS=1 BATCH_SIZE="${BATCH_SIZE:-16}" EVAL=0 WORKERS=8 bash scripts/run_experiments.sh nomask p1 42 \
+  || { echo "!!! nomask@p1 失败(很可能 OOM)。降 BATCH_SIZE 或减 P 后重试；见 README 排错。" >&2; exit 1; }
+
+echo "=== [3/3] gene2image @ c1 全链路 (1 epoch + eval) —— 记下本步墙钟 ==="
+t0=$SECONDS
+EPOCHS=1 BATCH_SIZE="${BATCH_SIZE:-16}" EVAL_BATCH=16 GEN_STEPS=100 WORKERS=8 \
+  bash scripts/run_experiments.sh gene2image c1 42
+echo "=== gene2image@c1 1-epoch+eval 墙钟 ≈ $((SECONDS-t0)) s ==="
+echo "  → 全量 c1 单 run ≈ (该值的训练部分) × 实际 epoch 数(早停,~20-100)。把它发回给助手算精确总时长。"
+echo "=== smoke 完成。产物在 $OUT_ROOT（可删）。若三步都过 → 用 pbs/submit_all.sh 提全量。 ==="

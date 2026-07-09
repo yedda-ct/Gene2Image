@@ -390,11 +390,29 @@ def train_with_rectified_flow(
                 else:
                     loss = base_loss
 
+            # NaN/inf guard: a stiff/degenerate batch can yield a non-finite loss.
+            # The AMP GradScaler already skips the optimiser step on inf/nan grads,
+            # but the non-AMP path would step on poisoned weights, and either way a
+            # NaN would enter the running metric. Skip the batch loudly instead.
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                if rank == 0 and batch_idx % 100 == 0:
+                    logger.warning(
+                        f"Non-finite train loss ({loss.item():.3e}) at epoch {epoch+1} "
+                        f"batch {batch_idx}; skipping this batch.")
+                continue
+
             if use_amp:
                 scaler(loss, optimizer, parameters=model.parameters(), update_grad=True)
             else:
                 optimizer.zero_grad()
                 loss.backward()
+                # Match the AMP path, which clips to max-norm 1.0 (see
+                # NativeScalerWithGradNormCount). Without this the non-AMP route
+                # (e.g. train.sh with USE_AMP unset) trains unclipped, so its
+                # optimisation dynamics differ from the AMP runs and it is more
+                # prone to divergence / NaN on stiff batches.
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
             train_loss_metric.update(loss)
@@ -520,10 +538,15 @@ def train_with_rectified_flow(
                     else:
                         loss = base_loss
 
-                val_loss_metric.update(loss)
                 # Pure velocity-MSE = base_loss - L1 (base_loss is mse + l1, and
                 # excludes spatial). This is the variant-comparable selection metric.
-                val_mse_metric.update(base_loss - l1_penalty)
+                # Guard against a non-finite val batch so a single NaN cannot perturb
+                # best-checkpoint / early-stop decisions.
+                _val_mse_batch = base_loss - l1_penalty
+                if torch.isfinite(loss):
+                    val_loss_metric.update(loss)
+                if torch.isfinite(_val_mse_batch):
+                    val_mse_metric.update(_val_mse_batch)
                 
                 # Update running validation loss for tqdm display (only on rank 0)
                 if rank == 0:
