@@ -21,7 +21,7 @@ checkpoints/
 .DS_Store
 
 code/logs/
-
+code/results/
 code/results_smoke/
 code/slurm/logs/
 	
