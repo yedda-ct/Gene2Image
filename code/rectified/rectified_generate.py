@@ -70,7 +70,7 @@ def main():
     # Data loading logic
     if args.hest1k_base_dir:
         if args.hest1k_sid is None or len(args.hest1k_sid) == 0:
-            hest_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/data/HEST-1k/data/HEST_v1_1_0.csv")
+            hest_metadata = pd.read_csv(os.environ.get("HEST_METADATA_CSV", "/depot/natallah/data/Mengbo/HnE_RNA/data/HEST-1k/data/HEST_v1_1_0.csv"))
             args.hest1k_sid = hest_metadata[(hest_metadata['st_technology']=='Xenium') & 
                                            (hest_metadata['species']=='Homo sapiens')]['id'].tolist()
         logger.info(f"Loading pre-processed HEST-1k data for sample {args.hest1k_sid}")
@@ -169,6 +169,10 @@ def main():
             for sample_id, stats in sample_stats.items():
                 logger.info(f" {sample_id}: {stats['n_patches']} patches, "
                            f"{stats['n_cells']} cells, {stats['n_genes']} genes")
+            # Resolve gene_names here (like the fast branch above) so gene-dim resolution
+            # doesn't fall through to len(gene_names) on None after the split rebinds
+            # `dataset` to a Subset (which does not forward .gene_names).
+            gene_names = getattr(dataset, 'gene_names', None)
         else:
             # Load patch-to-cell mapping
             logger.info(f"Loading patch-to-cell mapping from {args.patch_cell_mapping}")
@@ -206,11 +210,16 @@ def main():
 
     logger.info(f"Dataset created with {len(dataset)} samples")
 
-    # Split into train and validation sets
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    _, dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size]
+    # Use the held-out TEST split (80/10/10), reconstructed with the SAME seed as
+    # training/eval, so the visualized cells are the held-out test cells (never trained
+    # on) rather than a fresh unseeded 80/20 remainder that overlaps the training set.
+    n_total = len(dataset)
+    train_size = int(0.8 * n_total)
+    val_size = int(0.1 * n_total)
+    test_size = n_total - train_size - val_size
+    _, _, dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(args.seed)
     )
 
     # Create a subset of the dataset for generating images
@@ -314,6 +323,49 @@ def main():
 
     current_model_type = model_config_ckpt.get('model_type', args.model_type)
 
+    # Gene-order correctness guard (mirrors rectified_evaluate.py): load_state_dict only
+    # checks tensor SHAPES, and the pathway encoder fixes G from the mask, so a
+    # same-length-but-reordered gene panel (re-saved adata / different layer / --gene_symbols)
+    # would silently index the wrong genes and generate from corrupted conditioning. Fail loudly.
+    _ckpt_gene_names = model_config_ckpt.get('gene_names')
+    if _ckpt_gene_names and gene_names is not None:
+        _ckpt_g = [str(g) for g in _ckpt_gene_names]
+        _cur_g = [str(g) for g in gene_names]
+        if _ckpt_g != _cur_g:
+            _first = next((i for i, (a, b) in enumerate(zip(_ckpt_g, _cur_g)) if a != b), 'NA')
+            raise ValueError(
+                f"Generation gene order does not match the checkpoint's training gene order "
+                f"(len ckpt={len(_ckpt_g)} vs cur={len(_cur_g)}, first mismatch at index {_first}). "
+                f"The model was trained on a different gene ordering; generating like this uses "
+                f"misaligned conditioning. Align the panel to the training gene order.")
+
+    # Rebuild the SAME encoder the checkpoint was trained with. Without this, a pathway
+    # (Gene2Image / randPath / PathPrior / noTrans / noMask) checkpoint cannot be loaded:
+    # an RNA (GeneFlow) encoder would be built and load_state_dict would mismatch. Also
+    # push the checkpoint's img dims into the constructor args (they were captured from
+    # args above, before the config was read). Mirrors rectified_evaluate.py.
+    model_constructor_args['img_channels'] = args.img_channels
+    model_constructor_args['img_size'] = args.img_size
+    encoder_type = model_config_ckpt.get('encoder_type', getattr(args, 'encoder_type', 'rna'))
+    if encoder_type == 'pathway':
+        pathway_mask_arr = model_config_ckpt.get('pathway_mask_array', None)
+        if pathway_mask_arr is None:
+            mask_path = model_config_ckpt.get('pathway_mask', getattr(args, 'pathway_mask', None))
+            if mask_path is None:
+                raise ValueError("encoder_type='pathway' but no pathway mask in checkpoint config or --pathway_mask.")
+            pathway_mask_arr = np.load(mask_path, allow_pickle=True)['A']
+        pathway_mask_tensor = (pathway_mask_arr.to(torch.float32) if torch.is_tensor(pathway_mask_arr)
+                               else torch.tensor(np.asarray(pathway_mask_arr), dtype=torch.float32))
+        model_constructor_args.update(dict(
+            encoder_type='pathway',
+            pathway_mask=pathway_mask_tensor,
+            d_token=model_config_ckpt.get('d_token', getattr(args, 'd_token', 48)),
+            pt_layers=model_config_ckpt.get('pt_layers', getattr(args, 'pt_layers', 2)),
+            pt_heads=model_config_ckpt.get('pt_heads', getattr(args, 'pt_heads', 8)),
+            learnable_pathway=model_config_ckpt.get('learnable_pathway', getattr(args, 'learnable_pathway', True)),
+            use_pathway_transformer=model_config_ckpt.get('use_pathway_transformer', getattr(args, 'use_pathway_transformer', True)),
+        ))
+
     model = None
     try:
         if current_model_type == 'single':
@@ -331,6 +383,10 @@ def main():
         
         model.load_state_dict(model_state)
     except Exception as e:
+        if encoder_type == 'pathway':
+            # Never fall back to the legacy RNA constructors for a pathway checkpoint —
+            # that would drop every pathway weight and generate from a random-init encoder.
+            raise
         logger.warning(f"Failed to load model with current constructor: {e}. Trying deprecated constructor.")
         deprecated_constructor_args = model_constructor_args.copy()
         if 'relation_rank' in deprecated_constructor_args and current_model_type == 'single':
@@ -383,7 +439,8 @@ def main():
                     device=device,
                     num_steps=args.gen_steps,
                     gene_mask=gene_mask,
-                    is_multi_cell=False
+                    is_multi_cell=False,
+                    sample_ids=display_ids
                 )
         else:  # multi-cell model
             processed_batch = prepare_multicell_batch(batch, device)
@@ -400,7 +457,8 @@ def main():
                     device=device,
                     num_steps=args.gen_steps,
                     num_cells=num_cells_info,
-                    is_multi_cell=True
+                    is_multi_cell=True,
+                    sample_ids=display_ids
                 )
         
         # Accumulate results

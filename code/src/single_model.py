@@ -273,6 +273,13 @@ class RNAtoHnEModel(nn.Module):
         # RNA expression encoder. Both branches output [B, model_channels*4]=512,
         # so the UNet interface is identical and any quality delta is attributable
         # solely to the encoder.
+        # Capture the RNG state BEFORE building the (variant-specific) encoder; we restore
+        # it right before building the UNet so the UNet initializes from the SAME
+        # seed-dependent RNG point for ALL 6 variants (each encoder consumes a different
+        # number of RNG draws). This keeps the backbone init truly identical across variants
+        # -> any quality delta is attributable to the encoder alone (still differs across the
+        # 3 seeds, since the captured state is seed-dependent).
+        _pre_encoder_rng = torch.get_rng_state()
         if encoder_type == 'pathway':
             from src.pathway_encoder import PathwaySingleEncoder
             if pathway_mask is None:
@@ -302,6 +309,8 @@ class RNAtoHnEModel(nn.Module):
                 use_gene_relations=use_gene_relations,
             )
         
+        # Restore the pre-encoder RNG state so the UNet init is identical across variants.
+        torch.set_rng_state(_pre_encoder_rng)
         # UNet model for flow matching (unchanged)
         self.unet = RNAConditionedUNet(
             in_channels=img_channels,

@@ -1,320 +1,138 @@
 #!/bin/bash
 # =============================================================================
-# Gene2Image — Capella GPU fail-fast sbatch template
+# Gene2Image — Capella (TU Dresden ZIH) SPLIT launcher: short 4-GPU "wave" jobs
 #
-# 用法：
-#   sbatch -J g2i_b1 --export=ALL,BATCH=1 slurm/capella.slurm
-#   sbatch -J g2i_b2 --export=ALL,BATCH=2 slurm/capella.slurm
+# The matrix is split so each job is SHORT (≈ one experiment's walltime, not the
+# whole matrix) — far easier to schedule/backfill than one multi-day job, and a
+# preempted job only loses one wave. Each job still uses a full 4-GPU node.
 #
-# 关键特性：
-#   1. 自动检测 CUDA 是否可用
-#   2. 如果没有 GPU / torch.cuda 不可用，立即退出，不偷偷跑 CPU
-#   3. 自动根据实际可见 GPU 数量设置 run_all.sh 并发数
-#   4. 避免 “申请 4 卡却 run_all.sh 8” 导致部分任务 CUDA 失效
+# 3 modes (pick with MODE=...):
+#   MODE=prep : build image-path remap + pathway masks ONCE (small, ~30 min).
+#   MODE=run  : (default) ONE array task = 4 experiments in parallel on 4 GPUs.
+#               54 experiments -> 14 waves (array 0-13). Walltime ≈ one experiment.
+#   MODE=post : RQ4 interpret (from trained checkpoints) + final summary CSVs.
+#
+# CAPELLA RESOURCE TABLE (ZIH) -> SBATCH (full node share):
+#   4 GPU/node, 56 cores (14/GPU), 13,437 MB/core, 7-day max.
+#
+# SUBMISSION (with dependencies so it's one command chain):
+#   PREP=$(sbatch --parsable -J g2i_prep --export=ALL,MODE=prep --gres=gpu:1 \
+#                 --cpus-per-task=14 --time=00:30:00 slurm/capella.slurm)
+#   RUN=$(sbatch  --parsable -J g2i --export=ALL,MODE=run --array=0-13%4 \
+#                 --dependency=afterok:$PREP slurm/capella.slurm)
+#   sbatch -J g2i_post --export=ALL,MODE=post --gres=gpu:1 --cpus-per-task=14 \
+#          --time=04:00:00 --dependency=afterok:$RUN slurm/capella.slurm
+#   # %4 in --array = up to 4 waves (=16 GPUs) at once; raise/lower to taste.
+#   # Calibrate --time from the smoke test (§preflight); default 1 day per wave.
+#   # Re-queue only failed waves:  sbatch --array=<idx list> ... slurm/capella.slurm
 # =============================================================================
 
-#SBATCH --job-name=g2i_batch
+#SBATCH --job-name=g2i
 #SBATCH --partition=capella
-#SBATCH --account=swtest
+#SBATCH --account=CHANGEME_capella_account     # <- set your Capella project/account
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=56
-#SBATCH --mem=752520
-#SBATCH --cpu-freq=High
-#SBATCH --gres=gpu:4
-#SBATCH --time=72:00:00
-#SBATCH --output=logs/%x-%j.out
-#SBATCH --error=logs/%x-%j.err
+#SBATCH --gres=gpu:4                            # full node: 4 GPUs (one experiment per GPU)
+#SBATCH --cpus-per-task=56                      # 56 cores (14 per GPU)
+#SBATCH --mem-per-cpu=13000M                    # Capella core=13,437MB (per resource table)
+#SBATCH --time=1-00:00:00                       # per wave ≈ one experiment; Capella max 7 days
+#SBATCH --requeue                               # auto re-queue on preemption (pairs with --auto_resume)
+#SBATCH --output=logs/%x-%A_%a.out
+#SBATCH --error=logs/%x-%A_%a.err
 
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# Paths / environment
+# Site paths / modules / venv  (hard-coded Capella defaults, override via env)
 # -----------------------------------------------------------------------------
-
 PROJECT_DIR="${PROJECT_DIR:-/data/horse/ws/chwu350f-g2i/Gene2Image/code}"
 VENV_DIR="${VENV_DIR:-/data/horse/ws/chwu350f-g2i/venv_piptorch}"
-
 RELEASE_MODULE="${RELEASE_MODULE:-release/24.10}"
 GCCCORE_MODULE="${GCCCORE_MODULE:-GCCcore/13.2.0}"
 PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.5}"
 
-GMT_HALLMARK="${GMT_HALLMARK:-}"
-GMT_REACTOME="${GMT_REACTOME:-}"
-DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data/processed_data}"
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/results}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUTPUT_DIR}"
-INTERPRET_SEED="${INTERPRET_SEED:-42}"
-
-: "${BATCH:?必须设置 BATCH=1..8，例如 sbatch -J g2i_b1 --export=ALL,BATCH=1 slurm/capella.slurm}"
+DATA_ROOT="${DATA_ROOT:-$PROJECT_DIR/data/processed_data}"
+MASK_DIR="${MASK_DIR:-$PROJECT_DIR/data/pathway_masks}"
+OUT_ROOT="${OUT_ROOT:-$PROJECT_DIR/results}"
+export UNI2H_MODEL_PATH="${UNI2H_MODEL_PATH:-}"          # UNI2-h weights dir (else UNI2-h FID = NaN)
+export HE2RNA_MODEL_PATH="${HE2RNA_MODEL_PATH:-}"
+GMT_HALLMARK="${GMT_HALLMARK:-$PROJECT_DIR/../gmt/msigdb_2023.2_Hs/h.all.v2023.2.Hs.symbols.gmt}"
 
 module --force purge >/dev/null 2>&1 || module purge || true
 module load "${RELEASE_MODULE}" "${GCCCORE_MODULE}" "${PYTHON_MODULE}"
-
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
-
 cd "${PROJECT_DIR}"
-mkdir -p logs
-
-# -----------------------------------------------------------------------------
-# GPU fail-fast self-check
-# -----------------------------------------------------------------------------
-
-echo "============================================================"
-echo "Gene2Image Capella self-check"
-echo "date=$(date)"
-echo "host=$(hostname)"
-echo "job_id=${SLURM_JOB_ID:-<none>}"
-echo "job_name=${SLURM_JOB_NAME:-<none>}"
-echo "partition=${SLURM_JOB_PARTITION:-<none>}"
-echo "node_list=${SLURM_JOB_NODELIST:-<none>}"
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
-echo "SLURM_GPUS=${SLURM_GPUS:-<unset>}"
-echo "SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-<unset>}"
-echo "SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-<unset>}"
-echo "============================================================"
-
-echo "=== nvidia-smi ==="
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "ERROR: nvidia-smi not found. This job is probably not on a GPU node." >&2
-  exit 101
-fi
-
-if ! nvidia-smi; then
-  echo "ERROR: nvidia-smi failed. GPU is not visible inside this Slurm job." >&2
-  exit 102
-fi
-
-echo "=== PyTorch CUDA self-check ==="
-N_GPU="$(
-python - <<'PY'
-import sys
-import torch
-
-print("torch_version=", torch.__version__, file=sys.stderr)
-print("torch_cuda_version=", torch.version.cuda, file=sys.stderr)
-print("cuda_available=", torch.cuda.is_available(), file=sys.stderr)
-print("cuda_device_count=", torch.cuda.device_count(), file=sys.stderr)
-
-if not torch.cuda.is_available():
-    print("ERROR: torch.cuda.is_available() is False. Refusing to run on CPU.", file=sys.stderr)
-    sys.exit(10)
-
-n = torch.cuda.device_count()
-if n < 1:
-    print("ERROR: torch sees zero CUDA devices. Refusing to run.", file=sys.stderr)
-    sys.exit(11)
-
-for i in range(n):
-    props = torch.cuda.get_device_properties(i)
-    free, total = torch.cuda.mem_get_info(i)
-    print(
-        f"gpu[{i}] name={props.name} total={total/1024**3:.2f}GiB free={free/1024**3:.2f}GiB",
-        file=sys.stderr,
-    )
-
-print(n)
-PY
-)" || {
-  echo "ERROR: CUDA self-check failed. Job will exit instead of silently running on CPU." >&2
-  exit 103
-}
-
-echo "Detected visible CUDA GPU count: ${N_GPU}"
-
-if [ "${N_GPU}" -lt 1 ]; then
-  echo "ERROR: detected N_GPU=${N_GPU}. Refusing to run." >&2
-  exit 104
-fi
-
-# run_all.sh expects logical GPU ids relative to the current CUDA_VISIBLE_DEVICES.
-# If torch sees 4 devices, use GPUS='0 1 2 3' and MAX_PARALLEL=4.
-GPUS="$(seq -s ' ' 0 $((N_GPU - 1)))"
-export GPUS
-MAX_PARALLEL="${MAX_PARALLEL:-$N_GPU}"
-
-echo "Using GPUS='${GPUS}'"
-echo "Using MAX_PARALLEL='${MAX_PARALLEL}'"
-
-if [ "${MAX_PARALLEL}" -gt "${N_GPU}" ]; then
-  echo "ERROR: MAX_PARALLEL=${MAX_PARALLEL} > visible CUDA GPUs=${N_GPU}." >&2
-  echo "This would cause some child jobs to run without CUDA. Refusing to continue." >&2
-  exit 105
-fi
-
-# Optional: prevent PyTorch allocator fragmentation.
+mkdir -p logs "${MASK_DIR}" "${OUT_ROOT}"
+export PYTHONHASHSEED=0
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-# Reproducibility / common env
-export PYTHONHASHSEED=0
-export GMT_HALLMARK GMT_REACTOME
-export DATA_ROOT="${DATA_DIR}"
-export MASK_DIR="${MASK_DIR:-$PROJECT_DIR/data/pathway_masks}"
-
-# -----------------------------------------------------------------------------
-# Common experiment hyperparameters
-# -----------------------------------------------------------------------------
-
-COMMON="EPOCHS=100 BATCH_SIZE=16 EVAL_BATCH=8 GEN_STEPS=100 WORKERS=5 \
-INCLUDE_REACTOME=0 EXTRA=--use_amp OUT_ROOT=${OUTPUT_DIR}"
-
-run_batch() {
-  local ds="$1"
-  local var="$2"
-  local cross="$3"
-
-  echo "============================================================"
-  echo "run_all:"
-  echo "  DATASETS='${ds}'"
-  echo "  VARIANTS='${var}'"
-  echo "  INCLUDE_CROSS=${cross}"
-  echo "  SEEDS='${SEEDS:-42 43 44}'"
-  echo "  MAX_PARALLEL=${MAX_PARALLEL}"
-  echo "  GPUS='${GPUS}'"
-  echo "============================================================"
-
-  env $COMMON \
-    DATASETS="${ds}" \
-    VARIANTS="${var}" \
-    SEEDS="${SEEDS:-42 43 44}" \
-    INCLUDE_CROSS="${cross}" \
-    INCLUDE_INTERPRET=0 \
-    bash scripts/run_all.sh "${MAX_PARALLEL}"
-}
-
-case "${BATCH}" in
-  1)
-    run_batch "c1 c2" "gene2image geneflow" 0
-    ;;
-
-  2)
-    run_batch "c1 c2" "randpath pathprior" 0
-    ;;
-
-  3)
-    run_batch "c1 c2" "notrans nomask" 0
-    ;;
-
-  4)
-    run_batch "p1" "gene2image geneflow" 0
-    ;;
-
-  5)
-    run_batch "p1" "randpath pathprior" 0
-    ;;
-
-  6)
-    run_batch "p1" "notrans nomask" 0
-    ;;
-
-  7)
-    # VARIANTS="" means only cross-dataset jobs, no retraining main/ablation.
-    run_batch "c1 c2 p1" "" 1
-    ;;
-
-  8)
-    echo "=== Batch 8: RQ4 interpretability + final summary ==="
-
-    # This block runs c1/c2/p1 interpretation in parallel.
-    # It needs at least 3 visible GPUs.
-    if [ "${N_GPU}" -lt 3 ]; then
-      echo "ERROR: BATCH=8 needs at least 3 visible GPUs, but only ${N_GPU} detected." >&2
-      exit 106
-    fi
-
-    dataset_dir() {
-      case "$1" in
-        c1) echo "Xenium_V1_hSkin_Melanoma_Base_FFPE" ;;
-        c2) echo "Xeniumranger_V1_hSkin_Melanoma_Add_on_FFPE" ;;
-        p1) echo "Xenium_Prime_Human_Skin_FFPE" ;;
-        *)  echo "ERROR_UNKNOWN_DATASET" ;;
-      esac
-    }
-
-    adata_of() {
-      echo "${DATA_DIR}/$(dataset_dir "$1")/adata.h5ad"
-    }
-
-    imgpaths_of() {
-      echo "${DATA_DIR}/$(dataset_dir "$1")/cell_patch_256_aux/input/cell_image_paths_local.json"
-    }
-
-    missing=0
-    for ds in c1 c2 p1; do
-      ck="${OUTPUT_DIR}/gene2image_${ds}_seed${INTERPRET_SEED}/checkpoints/best_checkpoint.pt"
-      if [ ! -f "$ck" ]; then
-        echo "Missing checkpoint: $ck" >&2
-        missing=1
-      fi
-    done
-
-    if [ "$missing" = "1" ]; then
-      echo "ERROR: Required gene2image checkpoints are missing. Run batches 1 and 4 first." >&2
-      exit 1
-    fi
-
-    pids=()
-    gpu=0
-
-    for ds in c1 c2 p1; do
-      ck="${OUTPUT_DIR}/gene2image_${ds}_seed${INTERPRET_SEED}/checkpoints/best_checkpoint.pt"
-      gf="${OUTPUT_DIR}/geneflow_${ds}_seed${INTERPRET_SEED}/gene_importance_scores.csv"
-
-      gfarg=""
-      if [ -f "$gf" ]; then
-        gfarg="--geneflow_importance $gf"
-      else
-        echo "WARNING: $gf not found; GSEA consistency sub-analysis will be skipped for ${ds}."
-      fi
-
-      echo "START interpret ${ds} on logical GPU ${gpu}"
-
-      (
-        export CUDA_VISIBLE_DEVICES="${gpu}"
-
-        python - <<'PY'
-import sys
-import torch
-if not torch.cuda.is_available():
-    print("ERROR: CUDA unavailable inside interpret subprocess.", file=sys.stderr)
-    sys.exit(20)
-print("interpret subprocess CUDA OK:", torch.cuda.get_device_name(0), file=sys.stderr)
+# GPU fail-fast self-check
+echo "=== $(date) host=$(hostname) job=${SLURM_JOB_ID:-?} mode=${MODE:-run} task=${SLURM_ARRAY_TASK_ID:-none} ==="
+command -v nvidia-smi >/dev/null 2>&1 || { echo "ERROR: nvidia-smi missing"; exit 101; }
+nvidia-smi -L || { echo "ERROR: no GPU visible"; exit 102; }
+N_GPU="$(python - <<'PY'
+import sys, torch
+sys.exit(10) if (not torch.cuda.is_available() or torch.cuda.device_count()<1) else print(torch.cuda.device_count())
 PY
+)" || { echo "ERROR: torch CUDA self-check failed; refusing CPU run"; exit 103; }
+echo "Visible GPUs: ${N_GPU}"
 
-        python analysis/pathway_interpret.py \
-          --model_path "$ck" \
-          --adata "$(adata_of "$ds")" \
-          --image_paths "$(imgpaths_of "$ds")" \
-          --out_dir "${OUTPUT_DIR}/interpret/${ds}" \
-          $gfarg \
-          --gen_steps 100
-      ) > "logs/interpret_${ds}.log" 2>&1 &
+# -----------------------------------------------------------------------------
+# MODE=prep : build masks once (image-path remap + real/per-seed rand/none).
+# -----------------------------------------------------------------------------
+if [ "${MODE:-run}" = "prep" ]; then
+  [ -f "${GMT_HALLMARK}" ] || { echo "ERROR: Hallmark GMT not at ${GMT_HALLMARK}"; exit 111; }
+  DATA_ROOT="$DATA_ROOT" MASK_DIR="$MASK_DIR" OUT_ROOT="$OUT_ROOT" GMT_HALLMARK="$GMT_HALLMARK" \
+  SEEDS="42 43 44" VARIANTS="" INCLUDE_CROSS=1 INCLUDE_INTERPRET=0 DRY_RUN="${DRY_RUN:-0}" \
+    bash scripts/run_all.sh 1
+  echo "[ok] prep done"; exit 0
+fi
 
-      pids+=($!)
-      gpu=$((gpu + 1))
-    done
+# -----------------------------------------------------------------------------
+# MODE=post : RQ4 interpret (needs trained checkpoints) + final summary.
+# -----------------------------------------------------------------------------
+if [ "${MODE:-run}" = "post" ]; then
+  DATA_ROOT="$DATA_ROOT" MASK_DIR="$MASK_DIR" OUT_ROOT="$OUT_ROOT" GMT_HALLMARK="$GMT_HALLMARK" \
+  DATASETS="c1 c2 p1" VARIANTS="" INCLUDE_CROSS=0 INCLUDE_INTERPRET=1 \
+    bash scripts/run_all.sh 1
+  echo "[ok] interpret + summary done"; exit 0
+fi
 
-    fail=0
-    for p in "${pids[@]}"; do
-      wait "$p" || fail=1
-    done
+# -----------------------------------------------------------------------------
+# MODE=run : one array task = up to 4 experiments (one per GPU), run in parallel.
+#   The 54 (variant,dataset,seed) triples are a fixed list; task t = triples[4t..4t+3].
+#   Masks must already exist (MODE=prep). Fixed EPOCHS=50, early-stop off,
+#   --auto_resume; best checkpoint still selected on val_mse.
+# -----------------------------------------------------------------------------
+VARIANTS=(gene2image geneflow randpath pathprior notrans nomask)
+DATASETS=(c1 c2 p1)
+SEEDS=(42 43 44)
+ALL=()
+for v in "${VARIANTS[@]}"; do for d in "${DATASETS[@]}"; do for s in "${SEEDS[@]}"; do ALL+=("$v $d $s"); done; done; done   # 54
 
-    if [ "$fail" = "1" ]; then
-      echo "ERROR: at least one interpret task failed. See logs/interpret_*.log" >&2
-      exit 1
-    fi
+task="${SLURM_ARRAY_TASK_ID:?MODE=run needs a job array, e.g. --array=0-13}"
+per=4                                            # experiments per wave (one per GPU)
+start=$(( task * per ))
+[ "$N_GPU" -ge 1 ] || { echo "ERROR: N_GPU<1"; exit 104; }
 
-    echo "=== Final summary ==="
-    python scripts/summarize_results.py \
-      --results_root "${OUTPUT_DIR}" \
-      --out_dir "${OUTPUT_DIR}"
-    ;;
+pids=(); gpu=0
+for j in $(seq 0 $((per-1))); do
+  idx=$(( start + j ))
+  [ "$idx" -ge "${#ALL[@]}" ] && break
+  g=$(( gpu % N_GPU ))
+  read -r v d s <<< "${ALL[$idx]}"
+  echo ">>> wave task ${task}: exp ${idx} = ${v} ${d} seed${s} on GPU ${g}"
+  ( CUDA_VISIBLE_DEVICES="$g" \
+    EPOCHS="${EPOCHS:-50}" BATCH_SIZE="${BATCH_SIZE:-16}" EVAL_BATCH="${EVAL_BATCH:-8}" \
+    GEN_STEPS="${GEN_STEPS:-100}" WORKERS="${WORKERS:-14}" DB="${DB:-hallmark}" \
+    DATA_ROOT="$DATA_ROOT" MASK_DIR="$MASK_DIR" OUT_ROOT="$OUT_ROOT" \
+    EXTRA="${EXTRA:---use_amp --patience 9999 --auto_resume}" \
+      bash scripts/run_experiments.sh "$v" "$d" "$s" ) \
+    > "logs/${v}_${d}_s${s}.log" 2>&1 &
+  pids+=($!); gpu=$(( gpu + 1 ))
+done
 
-  *)
-    echo "ERROR: BATCH must be 1..8, got '${BATCH}'." >&2
-    exit 1
-    ;;
-esac
-
-echo "=== Batch ${BATCH} completed at $(date) ==="
+fail=0
+for p in "${pids[@]}"; do wait "$p" || fail=1; done
+[ "$fail" = 0 ] && echo "=== [ok] wave ${task} done at $(date) ===" || { echo "=== wave ${task} had failures (see logs/) ==="; exit 1; }

@@ -25,7 +25,7 @@
 #
 # COMMON KNOBS (env vars, with defaults):
 #   DATASETS="c1 c2 p1"  VARIANTS="gene2image geneflow randpath pathprior notrans nomask"
-#   SEEDS="42 43 44"     EPOCHS=100  BATCH_SIZE=16  EVAL_BATCH=8  GEN_STEPS=100  WORKERS=4
+#   SEEDS="42 43 44"     EPOCHS=50   BATCH_SIZE=16  EVAL_BATCH=8  GEN_STEPS=100  WORKERS=4
 #   INCLUDE_CROSS=1  INCLUDE_INTERPRET=1  INCLUDE_REACTOME=0  INTERPRET_SEED=42
 #   DATA_ROOT=data/processed_data  MASK_DIR=data/pathway_masks  OUT_ROOT=results
 #   EXTRA="--use_amp"   PY=python
@@ -65,7 +65,7 @@ DB=${DB:-hallmark}
 #   GMT_HALLMARK=/path/h.all.*.gmt  GMT_REACTOME=/path/c2.cp.reactome.*.gmt
 GMT_HALLMARK=${GMT_HALLMARK:-}
 GMT_REACTOME=${GMT_REACTOME:-}
-EPOCHS=${EPOCHS:-100}
+EPOCHS=${EPOCHS:-50}          # 对齐 GeneFlow 源代码 train.sh(EPOCHS=50)
 BATCH_SIZE=${BATCH_SIZE:-16}
 EVAL_BATCH=${EVAL_BATCH:-8}
 GEN_STEPS=${GEN_STEPS:-100}
@@ -84,6 +84,18 @@ INCLUDE_INTERPRET=${INCLUDE_INTERPRET:-1}
 INCLUDE_REACTOME=${INCLUDE_REACTOME:-0}
 INTERPRET_SEED=${INTERPRET_SEED:-42}
 DRY_RUN=${DRY_RUN:-0}
+
+# RQ4 interpret runs on a SINGLE seed's checkpoint (INTERPRET_SEED). If that seed
+# is not in SEEDS, its checkpoint is never trained and interpret would silently
+# produce nothing; fall back to the first trained seed instead.
+if [ -n "${SEEDS// /}" ]; then
+  case " $SEEDS " in
+    *" $INTERPRET_SEED "*) ;;
+    *) read -r _first_seed _ <<< "$SEEDS"   # whitespace-robust first token (leading spaces safe)
+       echo "  NOTE: INTERPRET_SEED=$INTERPRET_SEED not in SEEDS='$SEEDS'; using seed $_first_seed for RQ4 interpret."
+       INTERPRET_SEED=$_first_seed ;;
+  esac
+fi
 
 # GPU pool: explicit GPUS env wins; else 0..MAX_PARALLEL-1.
 if [ -n "${GPUS// /}" ]; then            # non-empty after stripping whitespace
@@ -150,9 +162,12 @@ prep_dataset() {
   # (interrupted, or rand/none deleted) would otherwise crash randpath/nomask jobs.
   local need=""
   for v in real rand none; do [ ! -f "$MASK_DIR/${ds}_hallmark_${v}.npz" ] && need=1; done
+  # randPath uses a per-seed random mask (so its multi-seed std reflects mask-draw
+  # variance, not just optimization noise); rebuild if any per-seed rand mask is missing.
+  for s in $SEEDS; do [ ! -f "$MASK_DIR/${ds}_hallmark_rand_s${s}.npz" ] && need=1; done
   gmt=$(gmt_args hallmark) || return 1
   [ -n "$need" ] && \
-    runcmd "$PY scripts/build_pathway_mask.py --adata \"$adata\" --prefix $ds --db hallmark $gmt --out_dir \"$MASK_DIR\" --seed 42"
+    runcmd "$PY scripts/build_pathway_mask.py --adata \"$adata\" --prefix $ds --db hallmark $gmt --out_dir \"$MASK_DIR\" --seed 42 --rand_seeds $SEEDS"
   return 0
 }
 build_cross_masks() {
@@ -205,8 +220,19 @@ verify_masks() {
     local suf; suf=$(mask_suffix_for_variant "$v")
     [ -z "$suf" ] && continue
     for ds in $DATASETS; do
-      local f="$MASK_DIR/${ds}_hallmark_${suf}.npz"
+      # Resolve via $DB (default hallmark) to match run_experiments.sh's mask path
+      # ${ds}_${DB}_${suf}.npz; hardcoding 'hallmark' would pass fail-fast then crash at
+      # load under a global DB override.
+      local f="$MASK_DIR/${ds}_${DB}_${suf}.npz"
       [ ! -f "$f" ] && missing+=("$f  (needed by variant '$v' on '$ds')")
+      # randpath consumes a PER-SEED rand mask (${ds}_${DB}_rand_s<seed>.npz); assert each so
+      # it doesn't silently fall back to the shared mask and collapse RQ2's 3-seed variance.
+      if [ "$suf" = "rand" ]; then
+        for s in $SEEDS; do
+          local fp="$MASK_DIR/${ds}_${DB}_rand_s${s}.npz"
+          [ ! -f "$fp" ] && missing+=("$fp  (per-seed rand mask for 'randpath' on '$ds' seed $s)")
+        done
+      fi
     done
   done
   # Optional Reactome granularity ablation on P1 (real mask only).
@@ -247,7 +273,7 @@ run_queue() {
   local -a free=("${GPU_IDS[@]}")
   [ ${#free[@]} -eq 0 ] && { echo ">>> ERROR: no GPU slots; aborting queue." >&2; return 1; }
   declare -A pidgpu pidname
-  local idx=0 total=${#specs[@]}
+  local idx=0 total=${#specs[@]} n_fail=0
   echo ">>> queue: $total job(s) over ${#free[@]} GPU slot(s): ${GPU_IDS[*]}"
   while [ $idx -lt $total ] || [ ${#pidgpu[@]} -gt 0 ]; do
     while [ ${#free[@]} -gt 0 ] && [ $idx -lt $total ]; do
@@ -268,10 +294,16 @@ run_queue() {
       if ! kill -0 "$pid" 2>/dev/null; then
         wait "$pid"; local rc=$?
         echo "[$(date +%H:%M:%S)] DONE  gpu=${pidgpu[$pid]} rc=$rc  ${pidname[$pid]}"
+        [ "$rc" -ne 0 ] && { n_fail=$((n_fail+1)); echo "  >>> FAILED (rc=$rc): ${pidname[$pid]} (log: $LOGDIR/${pidname[$pid]}.log)" >&2; }
         free+=("${pidgpu[$pid]}"); unset 'pidgpu[$pid]' 'pidname[$pid]'
       fi
     done
   done
+  if [ "$n_fail" -gt 0 ]; then
+    echo ">>> queue: $n_fail/$total job(s) FAILED (rc!=0). See per-job logs in $LOGDIR." >&2
+    return 1
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -309,11 +341,27 @@ build_train_jobs() {
 build_interpret_jobs() {
   INTERPRET_JOBS=()
   [ "$INCLUDE_INTERPRET" != "1" ] && return 0
-  case " $VARIANTS " in *" gene2image "*) ;; *) echo "  (interpret skipped: gene2image not in VARIANTS)"; return 0;; esac
+  # Emit RQ4 interpret jobs when gene2image WILL be trained this run (it is in VARIANTS,
+  # so its checkpoint exists by PHASE 2) OR its checkpoint already exists on disk (an
+  # interpret-only re-pass with VARIANTS=""). NOTE: build_interpret_jobs runs at PLAN time,
+  # BEFORE PHASE 1 training — so gating on checkpoint existence ALONE wrongly skips the
+  # from-scratch full run (checkpoints don't exist yet at planning); gating on VARIANTS
+  # ALONE wrongly skips the VARIANTS="" interpret-only pass. This covers both (and DRY_RUN).
   for ds in $DATASETS; do
     local ckpt="$OUT_ROOT/gene2image_${ds}_seed${INTERPRET_SEED}/checkpoints/best_checkpoint.pt"
+    case " $VARIANTS " in
+      *" gene2image "*) : ;;  # trained this run -> checkpoint will exist by PHASE 2
+      *)
+        if [ ! -f "$ckpt" ]; then
+          echo "  (interpret skipped for ${ds}: gene2image not in VARIANTS and no checkpoint at $ckpt)"
+          continue
+        fi ;;
+    esac
     local gfimp="$OUT_ROOT/geneflow_${ds}_seed${INTERPRET_SEED}/gene_importance_scores.csv"
     local cmd="$PY analysis/pathway_interpret.py --model_path \"$ckpt\" --adata \"$(adata_of "$ds")\" --image_paths \"$(imgpaths_of "$ds")\" --out_dir \"$OUT_ROOT/interpret/${ds}\" --geneflow_importance \"$gfimp\" --gen_steps $GEN_STEPS"
+    # Optional: name the adata.obs cell-type column for the per-cell-type RQ4-A
+    # analysis (else auto-detected). e.g. CELL_TYPE_KEY=cell_type bash scripts/run_all.sh
+    [ -n "${CELL_TYPE_KEY:-}" ] && cmd="$cmd --cell_type_key \"$CELL_TYPE_KEY\""
     INTERPRET_JOBS+=("interpret_${ds}"$'\t'"$cmd")
   done
 }
@@ -340,7 +388,7 @@ Generated by scripts/run_all.sh. All paths are relative to this ($OUT_ROOT/) fol
 | \`<variant>_<ds>_seed<seed>/\` | 2.1 / 2.2 (variant in gene2image, geneflow, randpath, pathprior, notrans, nomask[, gene2imageReactome]) | \`checkpoints/best_checkpoint.pt\`, \`training_losses.csv\`, \`evaluation_summary.json\`, \`gene_importance_scores.csv\` |
 | \`cross_dataset/<src>_to_<tgt>_seed<seed>/eval_on_<tgt>/\` | 2.3 cross-panel eval | \`evaluation_summary.json\` (fid_cross) |
 | \`cross_dataset/<src>_to_<tgt>_seed<seed>/eval_on_<src>/\` | 2.3 same-panel reference | \`evaluation_summary.json\` (fid_same) |
-| \`interpret/<ds>/\` | 2.4 RQ4 interpretability | \`attention.csv\`, \`A_endogeneity.json\`, \`gsea_consistency.json\` (top-k overlap + Spearman), \`intervention.csv\`, \`C_causal.json\` |
+| \`interpret/<ds>/\` | 2.4 RQ4 interpretability | \`attention.csv\`, \`A_endogeneity.json\`, \`gsea_consistency.json\` (top-k overlap + Spearman), \`intervention.csv\`, \`C_intervention_sensitivity.json\` |
 | \`logs/<job>.log\` | all | stdout/stderr per job |
 
 ## RQ -> evidence
@@ -374,17 +422,19 @@ echo "=== PLAN: ${#TRAIN_JOBS[@]} train/eval job(s); ${#INTERPRET_JOBS[@]} inter
 
 verify_masks
 
+OVERALL_RC=0
 echo "=== PHASE 1: training + evaluation (main / ablation / cross) ==="
-run_queue "${TRAIN_JOBS[@]}"
+run_queue "${TRAIN_JOBS[@]}" || OVERALL_RC=1
 
 echo "=== PHASE 2: RQ4 interpretability (after training) ==="
-run_queue "${INTERPRET_JOBS[@]}"
+run_queue "${INTERPRET_JOBS[@]}" || OVERALL_RC=1
 
 echo "=== PHASE 3: aggregate results into summary CSVs ==="
+NSEEDS=$(echo $SEEDS | wc -w)   # so a seed that fails uniformly across ALL arms is flagged, not silently "complete"
 if [ "$DRY_RUN" = "1" ]; then
-  echo "  [plan] $PY scripts/summarize_results.py --results_root \"$OUT_ROOT\" --out_dir \"$OUT_ROOT\""
+  echo "  [plan] $PY scripts/summarize_results.py --results_root \"$OUT_ROOT\" --out_dir \"$OUT_ROOT\" --expected_seeds $NSEEDS"
 else
-  $PY scripts/summarize_results.py --results_root "$OUT_ROOT" --out_dir "$OUT_ROOT"
+  $PY scripts/summarize_results.py --results_root "$OUT_ROOT" --out_dir "$OUT_ROOT" --expected_seeds "$NSEEDS" || OVERALL_RC=1
 fi
 
 echo "############################################################"
@@ -392,3 +442,9 @@ echo "# DONE. Deliverables under: $OUT_ROOT/"
 echo "#   summary_main.csv | ablation/summary.csv | cross_dataset/summary.csv"
 echo "#   interpret/<ds>/gsea_consistency.json | EXPERIMENTS_CATALOG.md"
 echo "############################################################"
+if [ "${OVERALL_RC:-0}" -ne 0 ]; then
+  echo ">>> WARNING: one or more train/eval/interpret job(s) FAILED (rc!=0); the summary above" >&2
+  echo ">>>          may be INCOMPLETE. Inspect the per-job logs, re-run the failed job(s), and" >&2
+  echo ">>>          re-run summarize before treating the results as final. Exiting non-zero." >&2
+  exit 1
+fi

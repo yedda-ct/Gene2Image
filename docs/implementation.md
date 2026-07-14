@@ -48,7 +48,7 @@ multi 模式：
 
 ### 1.3 训练/评估关键事实（精读结论，直接影响改写）
 
-- **整流流非线性路径**（`rectified_flow.py:53-98`）：`x_t = sin(t·π/2)·x_1 + (1-sin)·noise + 微扰`，`velocity = (x_1-noise)·(π/2)·cos(t·π/2)`。损失 = MSE(v_pred, velocity)。**本研究完全不改此文件。**
+- **整流流非线性路径**（`rectified_flow.py:53-98`）：`x_t = sin(t·π/2)·x_1 + (1-sin)·noise + 微扰`，`velocity = (x_1-noise)·(π/2)·cos(t·π/2)`。损失 = MSE(v_pred, velocity)。**速度场与损失不改**；唯一改动是 DOPRI5 采样器加了欠积分守卫（`:364-380`，步数耗尽时强制积分到 t=1）+ FSAL 阶段修复注释，速度场本身不动。
 - **L1 正则硬编码**（`rectified_train.py:323-331` 训练 / `:457-466` 验证）：
   - multi 取 `model.rna_encoder.cell_encoder[0].weight`
   - single 取 `model.rna_encoder.encoder[0].weight`
@@ -73,7 +73,7 @@ multi 模式：
 | `scripts/run_experiments.sh` | `[NEW]` | 6 变体 × 3 数据集 × 3 种子主实验+消融批量脚本 |
 | `scripts/run_cross_dataset.sh` | `[NEW]` | 跨数据集泛化（C1→C2 / C2→C1 / C1→P1）脚本 |
 | `analysis/pathway_interpret.py` | `[NEW]` | RQ4 三子分析：CLS 通路注意力提取、与 GSEA 一致性、通路干预因果验证 |
-| `rectified/rectified_flow.py` | `[KEEP]` | 整流流主干，绝不改动（隔离编码器贡献） |
+| `rectified/rectified_flow.py` | `[KEEP*]` | 整流流主干；速度场/损失不改，仅采样器加欠积分守卫(→t=1)+FSAL修复，编码器隔离不受影响 |
 | `src/unet.py` | `[KEEP]` | UNet 主干，绝不改动 |
 | `baseline/*` | `[KEEP]` | 扩散对照，本研究不动 |
 
@@ -153,7 +153,7 @@ gene_names（来自目标数据集 adata.var_names，顺序固定）
 - 初始化逻辑：
   1. 由 `mask` 求非零索引 `(p_idx, g_idx)`（`mask.nonzero()`），存为 buffer `edge_p`、`edge_g`，记 `E=len(p_idx)`（边数）
   2. 可学习权重 `self.W = nn.Parameter(torch.empty(E, d_token))`；偏置 `self.bias = nn.Parameter(torch.zeros(P, d_token))`
-  3. 初始化：`learnable=True` 时 `W` 用 `kaiming_uniform_`（或 `xavier`）；`init_weight` 给定时按 `(p,g)` 对应值广播到 `d_token` 维并 `requires_grad_(False)`（连同 bias）
+  3. 初始化：`learnable=True` 时 `W` 用 `kaiming_uniform_`（或 `xavier`）；`init_weight`（ssGSEA 标量）给定时**不广播成全 1 向量**，而是让每条边的标量去缩放一个固定、带种子(`manual_seed(1234567)`)、零均值单位范数的 `d_token` 维随机 profile（`W = 标量 · profile`），再 `requires_grad_(False)`（连同 bias 冻结）。原因：`c·ones` 的 token 会被 Transformer 的 pre-norm LayerNorm 去均值抹平 → PathPrior 变得输入无关、毁掉 RQ3 消融（代码 `pathway_encoder.py:79-95` 注释明确拒绝广播）
   4. 记录 `self.P, self.G, self.d_token, self.E`
 - `forward(x: Tensor) -> Tensor`：
   - 输入 `x`：`[N, G]`（N = B 或 B·C_max，已展平到二维）
@@ -176,14 +176,14 @@ gene_names（来自目标数据集 adata.var_names，顺序固定）
   - `d_cell`（int，默认 256）：CLS 输出投影后的细胞嵌入维度
 - 初始化逻辑：
   1. `self.cls = nn.Parameter(torch.zeros(1,1,d_token))`（CLS token，截断正态初始化）
-  2. `use_transformer=True`：`self.encoder = nn.TransformerEncoder(TransformerEncoderLayer(d_model=d_token, nhead=n_heads, dim_feedforward=4*d_token, dropout, batch_first=True, norm_first=True), num_layers=n_layers)`；**无位置编码**（通路无序）
+  2. `use_transformer=True`：**不用 `nn.TransformerEncoder`**，而是 `self.layers = nn.ModuleList([_CLSAttentionLayer(...) × n_layers])` + `self.final_norm = nn.LayerNorm(d_token)`。`_CLSAttentionLayer` 是手写 pre-norm(norm_first) 层：`nn.MultiheadAttention(batch_first=True)` + **GELU** 前馈(`dim_feedforward=4*d_token`)，功能等价 `TransformerEncoderLayer(norm_first,batch_first)`，手写是为导出 CLS→通路注意力；**无位置编码**（通路无序）
   3. `self.proj = nn.Linear(d_token, d_cell)`
-  4. 为可解释性保留注意力：`self.last_attn = None`（forward 中可选填充，见 analysis）
+  4. 注意力读出：每个 `_CLSAttentionLayer` 自带 `last_attn`（`PathwayTransformer` 本身**无** `last_attn`）；`get_pathway_attention` 取**最后一层**的 CLS→通路注意力
 - `forward(T: Tensor) -> Tensor`：
   - 输入 `T`：`[N, P, d_token]`
   - 逻辑：
     1. 拼 CLS：`seq = cat([cls.expand(N,1,d), T], dim=1)` → `[N, P+1, d_token]`
-    2. `use_transformer=True`：`h = self.encoder(seq)`；取 `h_cls = h[:,0]` → `[N, d_token]`
+    2. `use_transformer=True`：`for layer in self.layers: seq = layer(seq)` → `h = self.final_norm(seq)`；取 `h_cls = h[:,0]` → `[N, d_token]`
        `use_transformer=False`：`h_cls = T.mean(dim=1)`（noTrans：无通路交互，纯均值聚合）
     3. `h_cell = self.proj(h_cls)` → `[N, d_cell]`
   - 输出：`[N, d_cell]`
@@ -250,14 +250,15 @@ gene_names（来自目标数据集 adata.var_names，顺序固定）
 **`make_none_mask(P: int, G: int) -> np.ndarray`**
 - 返回全 1 矩阵 `[P,G]`（noMask，去稀疏：每通路 token 看到全部基因）。
 
-**`build_ssgsea_weights(adata_path, gene_names, A_real, pathway_names) -> np.ndarray`**
+**`build_ssgsea_weights(A_real, mean_expr=None) -> np.ndarray`**（AnnData 读取在独立的 `get_mean_expression()`）
 - 功能：为 PathPrior（RQ3）构造固定权重 `W_ssgsea [P,G]`，模拟 MUPAD 的固定 ssGSEA 富集打分思想。
-- 实现逻辑：
-  1. 用 `gseapy.ssgsea` 或基于通路内基因表达均值的固定打分，导出每个 (通路,基因) 的固定贡献权重（最简稳妥版：通路内基因取等权 `1/k_p`，或按训练集平均表达排序的固定权重）
-  2. 仅在 `A_real==1` 处有值，其余 0
-  > ⚠️ [低置信度：ssGSEA 权重的精确派生方式]：MUPAD 原文是「每通路压成一个标量分数」，本研究 PathPrior 为保证只翻转「可学习性」单变量、不丢 token 化（见 idea_report §2.0 PathPrior 精确定义），采用「固定 (通路,基因) 权重」而非标量。最简实现 = 通路内等权 + 冻结；若需更贴近 ssGSEA，可用训练集表达统计派生固定权重。编码阶段（E）先用等权冻结版跑通，后续按需精化。
+- 实现逻辑（`--ssgsea_mode {equal, expression}`，**默认 `expression`**）：
+  1. `expression`（默认，需 `--adata`）：每条通路内按基因平均表达加权、行和归一化到 1；某通路全零则回退等权。`equal`：通路内等权 `1/k_p`。
+  2. 仅在 `A_real==1` 处有值，其余 0。
+  > ⚠️ **train/val 泄漏提醒**：`get_mean_expression` 对 **h5ad 内全部细胞**（含各 seed 的验证集）求均值，**非仅训练集**——这是对 PathPrior(RQ3) 固定基线的一个小而对称的 train/val 泄漏（代码 docstring 已注明）。写进论文须说"全数据集平均表达"而非"训练集"。
+  > MUPAD 原文是「每通路压成一个标量」；PathPrior 为只翻转「可学习性」单变量、不丢 token 化（见 idea_report §2.0），用「固定 (通路,基因) 权重」而非标量。
 
-**`main()`**：CLI 接 `--adata`、`--gene_names_from`(single 用 adata / multi 用 unified_genes_cache.json)、`--db`、`--out_dir`、`--seed`，输出 `{dataset}_{db}_{variant}.npz`（variant∈real/rand/none，附 ssgsea 权重存同一 real npz 的 `W_ssgsea` key）。
+**`main()`**：CLI 接 `--adata`、**`--prefix`(必填,输出名前缀)**、`--gene_json`(基因名来源覆盖，替代文中旧写的 `--gene_names_from`)、`--db`、`--out_dir`、`--seed`、`--ssgsea_mode`、`--gmt`、`--min_genes`、`--rand_seeds`，输出 **`{prefix}_{db}_{variant}.npz`**（variant∈real/rand/none，ssgsea 权重存同一 real npz 的 `W_ssgsea` key）。掩码构造实为 `build_real_mask(gene_names, library, min_genes=3)` + `load_pathway_library(db, gmt_paths=None)`（无 `build_mask`）。
 
 ---
 
@@ -270,8 +271,8 @@ gene_names（来自目标数据集 adata.var_names，顺序固定）
 **`RNAtoHnEModel.__init__(..., encoder_type='rna', pathway_mask=None, d_token=48, pt_layers=2, pt_heads=8, learnable_pathway=True, use_pathway_transformer=True, pathway_init_weight=None)`**（新增参数）
 - 原来做什么：无条件 `self.rna_encoder = RNAEncoder(...)`。
 - 改为做什么：
-  1. `if encoder_type == 'rna':` 保持原 `RNAEncoder(...)` 不变（GeneFlow 基线/下界锚点）
-  2. `elif encoder_type == 'pathway':` `from src.pathway_encoder import PathwaySingleEncoder`；`self.rna_encoder = PathwaySingleEncoder(mask=pathway_mask, output_dim=model_channels*4, d_token=d_token, n_layers=pt_layers, n_heads=pt_heads, learnable=learnable_pathway, use_transformer=use_pathway_transformer, init_weight=pathway_init_weight)`
+  1. `if encoder_type == 'pathway':` `from src.pathway_encoder import PathwaySingleEncoder`；`self.rna_encoder = PathwaySingleEncoder(mask=pathway_mask, output_dim=model_channels*4, d_token=d_token, n_layers=pt_layers, n_heads=pt_heads, learnable=learnable_pathway, use_transformer=use_pathway_transformer, init_weight=pathway_init_weight)`
+  2. `else:`（即 `rna`，默认/兜底分支）保持原 `RNAEncoder(...)` 不变（GeneFlow 基线/下界锚点）。⚠️ 代码实为"pathway 显式分支 + 其余落 RNAEncoder"，非 `if rna/elif pathway`（任何非 'pathway' 值都走 RNAEncoder）
 - 参数变化：新增上列通路参数，均有默认值（默认 'rna' → 行为与原版完全一致，向后兼容）。
 - 返回值变化：无。`forward` 完全不变（编码器输出都是 `[B,512]`）。
 
@@ -285,17 +286,11 @@ gene_names（来自目标数据集 adata.var_names，顺序固定）
 
 **需要改写：L1 正则解耦（4 处，line 322-331 与 455-466）**
 - 原来做什么：`l1_penalty = torch.sum(torch.abs(model.rna_encoder.{cell_encoder|encoder}[0].weight)) * 0.001`
-- 改为做什么：统一改为调用编码器的 `l1_penalty()` 方法，并兼容原 RNAEncoder（原版无此方法 → 加兜底）：
-  1. 取 `enc = model.module.rna_encoder if isinstance(model, DDP) else model.rna_encoder`
-  2. `if hasattr(enc, 'l1_penalty'): l1_penalty = enc.l1_penalty() * l1_weight`
-  3. `else:`（原 RNAEncoder）保持原逻辑：取 `enc.cell_encoder[0].weight`（multi）/ `enc.encoder[0].weight`（single）
-  - 用函数封装 `def _compute_l1(model, is_multi_cell, l1_weight): ...` 放文件顶部，4 处调用它，消除重复。
-- 参数变化：`train_with_rectified_flow` 新增 `l1_weight=0.001` 形参（默认与原一致）。
-- 返回值变化：无。
+- **代码实际做法**：顶部封装 `def compute_l1_penalty(model, l1_weight)`（名字**不是** `_compute_l1`），在**训练与验证 2 处**调用（`rectified_train.py:359`/`:504`，**不是 4 处**；DDP/非DDP 差异在函数内用 `isinstance(model, DDP)` 处理）。函数**无 hasattr 兜底**：`return enc.l1_penalty() * l1_weight`，编码器若没有 `l1_penalty()` 直接 `AttributeError`（故意不静默回退）。
+- 为此给原 `RNAEncoder`/`MultiCellRNAEncoder` **各补 `l1_penalty()`**：它罚的是**第一个 `nn.Linear`（基因→隐层投影，权重 `[hidden, G]`）的 L1**，**不是** `encoder[0]`/`cell_encoder[0]`——因为默认 `use_layer_norm=True` 下 `encoder[0]` 是 LayerNorm 增益向量 `[G]`，罚它无意义且与通路编码器的 `‖W‖₁` 不可比。（故上文 §1.3 提到的 `encoder[0].weight` 应理解为原始 GeneFlow 的写法。）
+- 参数变化：`train_with_rectified_flow` 新增 `l1_weight=0.001` 形参。返回值无变化。
 
-> 为什么这样改：通路编码器的 L1 应作用在通路权重 W 上而非首层线性层；硬编码属性名会让新编码器崩溃。封装为方法调用是最干净的解耦。这是阶段 D 识别的**头号崩溃点**。
-
-> 同时给原 `RNAEncoder` / `MultiCellRNAEncoder`（src/single_model.py、multi_model.py）**也补一个 `l1_penalty()` 方法**（返回原首层权重的 L1），这样 4 处分支可统一为「调用 l1_penalty()」，彻底消除 hasattr 兜底。推荐此做法。
+> 为什么这样改：通路编码器的 L1 应作用在通路权重 W 上；硬编码属性名会让新编码器崩溃。全编码器统一实现 `l1_penalty()`、缺失即报错（非静默回退）是最干净且可比的解耦。这是阶段 D 识别的**头号崩溃点**。
 
 ---
 
@@ -309,7 +304,7 @@ gene_names（来自目标数据集 adata.var_names，顺序固定）
 - 逻辑：
   1. `if args.encoder_type == 'pathway':` 加载 `np.load(args.pathway_mask)`，取 `A`（按 variant 已是 real/rand/none），转 `torch.tensor` → `pathway_mask`
   2. 校验 `A.shape[1] == gene_dim`（列数必须等于当前 gene_names 长度），不等则报错（提示掩码与数据集 panel 不匹配）
-  3. PathPrior 时额外加载 `W_ssgsea` → `pathway_init_weight`，并置 `learnable_pathway=False`
+  3. PathPrior 由 `--no_learnable_pathway` 触发（此时 `args.learnable_pathway` 已为 False）；main 据此加载 `W_ssgsea` → `pathway_init_weight`，并把已为 False 的 `learnable_pathway` 透传给模型（**main 本身不设置**这个 flag，只是响应）
 
 **B. 透传参数到 `model_constructor_args`（修改 line 383-405）**
 - 新增 keys：`encoder_type=args.encoder_type, pathway_mask=pathway_mask, d_token=args.d_token, pt_layers=args.pt_layers, pt_heads=args.pt_heads, learnable_pathway=args.learnable_pathway, use_pathway_transformer=args.use_pathway_transformer, pathway_init_weight=pathway_init_weight`
@@ -341,6 +336,7 @@ pathway_group = parser.add_argument_group('Pathway Encoder')
 --use_pathway_transformer     action=store_true default=True    # 配 --no_pathway_transformer → noTrans
 --no_pathway_transformer      dest=use_pathway_transformer store_false
 --l1_weight float             default=0.001
+--cross_dataset_eval          action=store_true default=False  # 跨数据集迁移评估（在目标掩码重建编码器，按通路/基因名移植权重）
 ```
 
 > 6 变体的 CLI 组合（single，img_channels=4）：
@@ -371,10 +367,10 @@ pathway_group = parser.add_argument_group('Pathway Encoder')
 **文件职责**：对训练好的 Gene2Image（single）做通路可解释性分析，对应 Part 3 §2.4。
 
 **子分析 A — `extract_pathway_attention(model, data_loader, device) -> pd.DataFrame`**
-- 提取 PathwayTransformer 中 CLS→各通路 token 注意力 `α_{cls→p}`（多层多头平均），逐细胞 `[N, P]`。
+- 提取 PathwayTransformer 中 CLS→各通路 token 注意力 `α_{cls→p}`（**末层、多头平均**——代码 `get_pathway_attention` 只取最后一层，非跨层平均），逐细胞 `[N, P]`。
 - 实现：给 TransformerEncoderLayer 的 self-attn 注册 hook 取 `attn_output_weights`（需 `need_weights=True, average_attn_weights=True`），或自定义 attention 子层返回权重。取 CLS 行对其余 P 列。
 - 输出指标：通路注意力熵 `-Σ α_p log α_p`（越低越聚焦）；按细胞类型聚合的 top-k 主导通路；细胞类型-通路 Jaccard 特异性。
-- 结果存 `results/interpret/{ds}_attention.csv`（cell_id, cell_type, pathway, attention）。
+- 结果存 `results/interpret/{ds}_attention.csv`（**列实为 cell_id, cell_type, entropy, top_pathway, top_attention**，每行一个细胞的 argmax 主导通路），另出 `attention_by_celltype.csv`（rank, mean_attention）。
 
 **子分析 B — `consistency_with_gsea(attn_df, geneflow_importance_csv) -> dict`**
 - 将 Gene2Image top-k 主导通路 vs GeneFlow `gene_importance_scores.csv` 经 GSEA 富集的通路对照。
@@ -382,8 +378,8 @@ pathway_group = parser.add_argument_group('Pathway Encoder')
 - > GeneFlow gene importance 由 `analyze_gene_importance`（src/utils.py:449）产出，仅 single 可用——这正是选 single 为主干的价值之一。
 
 **子分析 C — `pathway_intervention(model, ...) -> pd.DataFrame`**
-- 推理时干预通路 token：消融（置零/置均值）或增强（放大范数），重新生成，测形态偏移。
-- 指标：干预前后生成图 UNI2-h 嵌入距离 / 核形态变化；主导通路 vs 随机通路偏移比值（干预特异性）。
+- 推理时干预通路 token：消融（**仅置零**，未实现"置均值"）或增强（范数 ×3；代码有但默认流程只跑消融，`mode` 默认 `ablate`、无 CLI 开关切 amplify）；基线与各干预**共享同一初始噪声**后重新生成，测形态偏移。
+- 指标：干预前后生成图的**像素级 L2 距离**（代码实际；UNI2-h 嵌入距离/核形态变化**未实现**）；主导通路 vs 随机通路偏移比值（干预特异性）。
 - 实现：在 PathwayMaskEmbedding 输出 T 处插入干预钩子（指定 pathway idx 操作），其余前向不变。
 
 ---
@@ -437,7 +433,7 @@ python scripts/build_pathway_mask.py --adata data/processed_data/Xenium_V1_hSkin
 ## 5 results 文件格式规范
 
 ### 5.1 模型权重 `results/{exp_name}/checkpoints/best_checkpoint.pt`
-- 格式：PyTorch dict，含 `model_state_dict`、`epoch`、`best_val_loss`、`val_loss`、**`model_config`**（新增：encoder_type/pathway_mask/d_token/...，供 eval 重建模型）。
+- 格式：PyTorch dict，含 `model_state_dict`、`epoch`、`best_val_loss`(实存 best **val_mse**)、`val_loss`、以及**键名 `config`**（**非 `model_config`**——eval/generate 读 `checkpoint.get('config')`；内含 encoder_type/pathway 参数/`gene_names`/`val_mse`/`pathway_mask_array` 等，供 eval 重建模型）。
 - 读取：`torch.load(path, map_location='cpu')`。
 
 ### 5.2 训练曲线 `results/{exp_name}/training_losses.csv`（复用原 GeneFlow 输出）

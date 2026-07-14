@@ -103,9 +103,13 @@ class CellImageGeneDataset(Dataset):
                 pil_img = PILImage.fromarray(image)
                 image = self.transform(pil_img) if self.transform else transforms.ToTensor()(pil_img)
             except Exception as e:
-                logger.error(f"Error loading image {img_source}: {e}")
-                pil_img = PILImage.new('RGB', (self.img_size, self.img_size), (0, 0, 0))
-                image = self.transform(pil_img) if self.transform else transforms.ToTensor()(pil_img)
+                # Substitute a zero image with EXACTLY self.img_channels channels. The old
+                # fallback built a 3-channel PIL('RGB') image, which — when img_channels=4 —
+                # produces a mis-shaped sample that crashes the entire batch in default_collate
+                # (torch.stack) instead of skipping the one unreadable cell.
+                logger.error(f"Error loading image {img_source}: {e}; substituting a zero "
+                             f"{self.img_channels}-channel image.")
+                image = torch.zeros(self.img_channels, self.img_size, self.img_size)
 
         return {
             'cell_id': cell_id,

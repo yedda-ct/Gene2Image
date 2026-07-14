@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=test_cuda_piptorch
-#SBATCH --partition=alpha
-#SBATCH --account=swtest
+#SBATCH --partition=capella
+#SBATCH --account=CHANGEME_capella_account     # <- set your Capella project/account
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=6
-#SBATCH --mem=20G
+#SBATCH --mem-per-cpu=13000M                    # Capella: 13,437 MB per core (per resource table)
 #SBATCH --time=00:10:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err

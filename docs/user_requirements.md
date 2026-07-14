@@ -58,7 +58,7 @@ img_size=256, img_channels=4（H&E + DAPI aux）。
 ### 代码接入点（已分析，最小侵入方案 A）
 - 关键硬约束：**PathwayEncoder.forward 必须输出 [B, 512]**（=model_channels128×4），
   UNet 的 rna_proj/rna_embed_dim 一行不用改。
-- 替换点：multi_model.py:308 / single_model.py:246 的 `self.rna_encoder=...`
+- 替换点：`self.rna_encoder=...`（原始 GeneFlow 行号 multi_model.py:308 / single_model.py:246；改后实际赋值在 single_model.py:280(pathway)/:291(else=rna)、multi_model.py:337/:351）
 - multi 输入 gene_expr=[B, C_max, G]，C_max 是 batch 内动态 max(num_cells)，
   **0-padding 无显式 mask，靠 num_cells 屏蔽**（参考 multi_model.py:207-221）。
 - 数据流不做 log1p（FastSeparatePatchDataset 读已预处理的 .h5）；

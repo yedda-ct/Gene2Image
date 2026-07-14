@@ -3,13 +3,16 @@
 # GeneFlow Image Generation Script
 # Generate synthetic histopathological images from gene expression
 
-# Model path
-MODEL_PATH="/GeneFlow/results/checkpoints/best_model.pt"
+# Model path. Edit the variant/dataset/seed to pick which trained checkpoint to visualize
+# (default: the main method on c1, seed 42). The encoder type + pathway mask are auto-rebuilt
+# from the checkpoint config, so this works for ANY variant (gene2image / geneflow / ...).
+MODEL_PATH="results/gene2image_c1_seed42/checkpoints/best_checkpoint.pt"
 
-# Data paths
-ADATA="/GeneFlow/processed_data/Xenium_V1_hSkin_Melanoma_Base_FFPE/adata.h5ad"
-IMAGE_PATHS="/GeneFlow/processed_data/Xenium_V1_hSkin_Melanoma_Base_FFPE/cell_patch_256_aux/input/cell_image_paths.json"
-OUTPUT_DIR="/GeneFlow/generated_results"
+# Data paths (canonical layout under code/; cell_image_paths_local.json is produced by
+# run_all.sh PHASE 0 via fix_image_paths.py). Keep adata/image_paths matching MODEL_PATH's dataset.
+ADATA="data/processed_data/Xenium_V1_hSkin_Melanoma_Base_FFPE/adata.h5ad"
+IMAGE_PATHS="data/processed_data/Xenium_V1_hSkin_Melanoma_Base_FFPE/cell_patch_256_aux/input/cell_image_paths_local.json"
+OUTPUT_DIR="results/qualitative_gene2image_c1"
 
 # Model configuration
 MODEL_TYPE="single"

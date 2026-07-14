@@ -89,7 +89,7 @@ scikit-image      # 评估 SSIM/PSNR
 timm              # UNI2-h 病理特征 (可选指标)
 einops            # HE2RNA round-trip (可选)
 safetensors       # HE2RNA 权重加载 (可选)
-# opencv-python-headless==4.10.0.84   # 评估纹理特征 (numpy<2 兼容版)
+opencv-python-headless==4.10.0.84   # UNI2-h 生物学 FID 必需 (rectified/utils_uni2h.py import cv2); numpy<2 兼容版
 tornado==6.5.2
 tqdm==4.67.1
 typing_extensions==4.15.0

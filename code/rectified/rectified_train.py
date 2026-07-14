@@ -390,11 +390,29 @@ def train_with_rectified_flow(
                 else:
                     loss = base_loss
 
+            # NaN/inf guard: a stiff/degenerate batch can yield a non-finite loss.
+            # The AMP GradScaler already skips the optimiser step on inf/nan grads,
+            # but the non-AMP path would step on poisoned weights, and either way a
+            # NaN would enter the running metric. Skip the batch loudly instead.
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                if rank == 0 and batch_idx % 100 == 0:
+                    logger.warning(
+                        f"Non-finite train loss ({loss.item():.3e}) at epoch {epoch+1} "
+                        f"batch {batch_idx}; skipping this batch.")
+                continue
+
             if use_amp:
                 scaler(loss, optimizer, parameters=model.parameters(), update_grad=True)
             else:
                 optimizer.zero_grad()
                 loss.backward()
+                # Match the AMP path, which clips to max-norm 1.0 (see
+                # NativeScalerWithGradNormCount). Without this the non-AMP route
+                # (e.g. train.sh with USE_AMP unset) trains unclipped, so its
+                # optimisation dynamics differ from the AMP runs and it is more
+                # prone to divergence / NaN on stiff batches.
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
             train_loss_metric.update(loss)
@@ -520,10 +538,15 @@ def train_with_rectified_flow(
                     else:
                         loss = base_loss
 
-                val_loss_metric.update(loss)
                 # Pure velocity-MSE = base_loss - L1 (base_loss is mse + l1, and
                 # excludes spatial). This is the variant-comparable selection metric.
-                val_mse_metric.update(base_loss - l1_penalty)
+                # Guard against a non-finite val batch so a single NaN cannot perturb
+                # best-checkpoint / early-stop decisions.
+                _val_mse_batch = base_loss - l1_penalty
+                if torch.isfinite(loss):
+                    val_loss_metric.update(loss)
+                if torch.isfinite(_val_mse_batch):
+                    val_mse_metric.update(_val_mse_batch)
                 
                 # Update running validation loss for tqdm display (only on rank 0)
                 if rank == 0:
@@ -725,7 +748,7 @@ def train_with_rectified_flow(
             latest_link = os.path.join(checkpoint_dir, f"latest_checkpoint{spatial_suffix}.pt")
             best_link = os.path.join(checkpoint_dir, f"best_checkpoint{spatial_suffix}.pt")
             
-            for link_path in [latest_link, best_link]:
+            for link_path in [best_link]:  # latest is saved unconditionally per-epoch below
                 if os.path.exists(link_path) or os.path.islink(link_path):
                     os.remove(link_path)
                 try:
@@ -762,6 +785,36 @@ def train_with_rectified_flow(
                     phase = "spatial training" if spatial_loss_was_active else "training"
                     logger.info(f"Early stopping triggered after {epoch+1} epochs ({phase})")
                     early_stop = True
+
+        # --- Decoupled resume: save latest_checkpoint.pt EVERY epoch (unconditional) so
+        #     --auto_resume continues from the last COMPLETED epoch, not the last val_mse
+        #     improvement. best_checkpoint.pt stays improvement-only (block above).
+        if rank == 0:
+            _ckpt_dir = os.path.join(os.path.dirname(best_model_path), "checkpoints")
+            os.makedirs(_ckpt_dir, exist_ok=True)
+            _msd = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
+            _latest = {
+                'epoch': epoch,
+                'model_state_dict': _msd,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'lr_scheduler_state_dict': lr_scheduler.state_dict(),
+                'lr_scheduler_T_max': num_epochs,
+                'best_val_loss': best_val_loss,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'val_mse': val_mse,
+                'spatial_loss_enabled': (spatial_loss_weight_current > 0),
+                'spatial_loss_start_epoch': spatial_loss_actual_start_epoch if spatial_loss_weight_current > 0 else None,
+            }
+            if model_config is not None:
+                _latest['config'] = model_config
+            if scaler is not None:
+                _latest['scaler_state_dict'] = scaler.state_dict()
+            _suffix = "_spatial" if spatial_loss_weight_current > 0 else ""
+            _latest_path = os.path.join(_ckpt_dir, f"latest_checkpoint{_suffix}.pt")
+            _tmp = _latest_path + ".tmp"
+            torch.save(_latest, _tmp)
+            os.replace(_tmp, _latest_path)  # atomic rename: preemption-safe
 
         # Broadcast early stopping decision to all ranks
         if use_ddp:

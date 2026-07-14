@@ -130,7 +130,7 @@ def main():
     # Data loading logic (same as original)
     if args.hest1k_base_dir:
         if args.hest1k_sid is None or len(args.hest1k_sid) == 0:
-            hest_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/data/HEST-1k/data/HEST_v1_1_0.csv")
+            hest_metadata = pd.read_csv(os.environ.get("HEST_METADATA_CSV", "/depot/natallah/data/Mengbo/HnE_RNA/data/HEST-1k/data/HEST_v1_1_0.csv"))
             args.hest1k_sid = hest_metadata[(hest_metadata['st_technology']=='Xenium') & \
                                             (hest_metadata['species']=='Homo sapiens')]['id'].tolist()
         if rank == 0:
@@ -276,13 +276,31 @@ def main():
         if rank == 0:
             logger.info(f"Debug dataset size: {len(dataset)}")
     
-    # Split into train and validation sets
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size], 
+    # Split into train / validation / held-out TEST sets (80/10/10).
+    # FIX (2026-07): previously an 80/20 train/val split whose val set was ALSO used
+    # as the evaluation set (no independent test) -> checkpoint selection and the
+    # reported FID/SSIM/PSNR shared the same 20%. We now hold out a separate 10% test
+    # set that is NEVER used for training or checkpoint selection. rectified_evaluate.py
+    # rebuilds the SAME split with the same seed and reports metrics on this test set.
+    n_total = len(dataset)
+    train_size = int(0.8 * n_total)
+    val_size = int(0.1 * n_total)
+    test_size = n_total - train_size - val_size
+    # Guard against a degenerate split on a tiny dataset: for n_total < 10,
+    # val_size = int(0.1*n_total) = 0, which yields an empty val set -> checkpoint
+    # selection over zero samples (val_mse = NaN, best model never saved) with no error.
+    if train_size == 0 or val_size == 0 or test_size == 0:
+        raise ValueError(
+            f"Dataset too small for an 80/10/10 split (n={n_total}): "
+            f"train={train_size}, val={val_size}, test={test_size}. "
+            f"Increase --debug_samples or use a larger dataset.")
+    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(args.seed)
     )
+    if rank == 0:
+        logger.info(f"Split (seed={args.seed}): train={train_size}, val={val_size} "
+                    f"(checkpoint selection), test={test_size} (held out for evaluation)")
 
     # Create distributed samplers
     if args.use_ddp:
@@ -417,12 +435,47 @@ def main():
         if rank == 0:
             logger.info(f"Loaded pathway mask {A.shape} from {args.pathway_mask} "
                         f"(P={A.shape[0]} pathways, {int(A.sum())} edges)")
-        # PathPrior: freeze weights, initialise from ssGSEA-derived fixed weights.
+        # PathPrior: freeze weights at fixed, ssGSEA-style values.
+        # FIX (2026-07): recompute the fixed expression weights from the TRAINING split
+        # ONLY. build_pathway_mask.py's W_ssgsea averages expression over ALL cells
+        # (including the held-out val/test cells), leaking evaluation-set statistics
+        # into the RQ3 fixed baseline. Here we recompute the per-gene mean over just
+        # this seed's training cells and rebuild the frozen (pathway, gene) weights, so
+        # PathPrior never sees evaluation-cell expression. Falls back to the mask's
+        # W_ssgsea if the train cells can't be recovered (e.g. multi-cell datasets).
         if not args.learnable_pathway:
-            if 'W_ssgsea' in mask_npz.files:
+            train_w = None
+            try:
+                _idxs, _base = None, train_dataset
+                while hasattr(_base, 'dataset') and hasattr(_base, 'indices'):
+                    _idxs = list(_base.indices) if _idxs is None else [_base.indices[i] for i in _idxs]
+                    _base = _base.dataset
+                if _idxs is not None and hasattr(_base, 'expr_df') and hasattr(_base, 'cell_ids') \
+                        and gene_names is not None:
+                    import importlib.util as _ilu
+                    _spec = _ilu.spec_from_file_location(
+                        "build_pathway_mask",
+                        os.path.join(os.path.dirname(__file__), "..", "scripts", "build_pathway_mask.py"))
+                    _bpm = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_bpm)
+                    _train_cells = [_base.cell_ids[i] for i in _idxs]
+                    _tmean = _base.expr_df.loc[_train_cells].mean(axis=0)
+                    _tmean = _tmean.reindex(gene_names).fillna(0.0).values.astype(np.float32)
+                    train_w = _bpm.build_ssgsea_weights(A, _tmean)
+            except Exception as _e:
+                if rank == 0:
+                    logger.warning(f"PathPrior: train-only weight recompute failed ({_e}); "
+                                   f"falling back to mask W_ssgsea.")
+                train_w = None
+            if train_w is not None:
+                pathway_init_weight = torch.tensor(train_w, dtype=torch.float32)
+                if rank == 0:
+                    logger.info(f"PathPrior: frozen weights recomputed from {len(_idxs)} "
+                                f"TRAINING cells only (leak-free, expression-weighted).")
+            elif 'W_ssgsea' in mask_npz.files:
                 pathway_init_weight = torch.tensor(mask_npz['W_ssgsea'], dtype=torch.float32)
                 if rank == 0:
-                    logger.info("PathPrior: loaded frozen W_ssgsea weights")
+                    logger.warning("PathPrior: using mask W_ssgsea (may include eval cells; "
+                                   "train-only recompute unavailable, e.g. multi-cell).")
             elif rank == 0:
                 logger.warning("--no_learnable_pathway but mask has no W_ssgsea; "
                                "weights frozen at default init.")
@@ -661,6 +714,15 @@ def main():
                 'img_channels': args.img_channels,
                 'img_size': args.img_size,
                 'encoder_type': args.encoder_type,
+                # RNA-encoder architecture flags — persisted so evaluation rebuilds
+                # the exact graph and labels the run from the checkpoint, instead of
+                # falling back to (possibly different) eval-time CLI defaults.
+                'use_gene_attention': args.use_gene_attention,
+                'use_multi_head_attention': args.use_multi_head_attention,
+                'use_feature_gating': args.use_feature_gating,
+                'use_residual_blocks': args.use_residual_blocks,
+                'use_layer_norm': args.use_layer_norm,
+                'use_gene_relations': args.use_gene_relations,
                 'pathway_db': args.pathway_db,
                 'pathway_mask': args.pathway_mask,
                 # Store as a torch tensor (not numpy) so checkpoints remain

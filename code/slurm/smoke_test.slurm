@@ -12,14 +12,14 @@
 # （ntasks*cpus-per-task ≤ 6*GPU数）。这里 1*6=6 ✓
 # =============================================================================
 #SBATCH --job-name=g2i_smoke
-#SBATCH --partition=alpha
+#SBATCH --partition=capella
 #SBATCH --exclude=i8009
-#SBATCH --account=swtest
+#SBATCH --account=CHANGEME_capella_account     # <- set your Capella project/account
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=6
-#SBATCH --mem=100G
+#SBATCH --mem-per-cpu=13000M                    # Capella: 13,437 MB per core (per resource table)
 #SBATCH --time=00:30:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err

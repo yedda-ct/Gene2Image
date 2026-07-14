@@ -11,8 +11,10 @@ gene-name JSON), this constructs:
     A_none  [P, G]  : all-ones matrix (no sparsity).                  -> noMask
     W_ssgsea[P, G]  : fixed (pathway, gene) weights for PathPrior (RQ3), frozen at
                       train time. --ssgsea_mode expression (default) weights genes
-                      by train-set mean expression within each pathway; 'equal'
-                      uses within-pathway 1/k.
+                      by FULL-PANEL mean expression within each pathway (mean over
+                      ALL cells in the AnnData; note this includes the cells that
+                      training later holds out as the 20% eval split -- see caveat
+                      in get_mean_expression); 'equal' uses within-pathway 1/k.
 
 The mask column order is *identical* to the dataset gene order, which is the order
 the model receives at runtime (``adata.var_names`` for single / unified gene cache
@@ -168,9 +170,16 @@ def make_none_mask(P, G):
 def get_mean_expression(adata_path, gene_names):
     """Mean expression per gene (in ``gene_names`` order) for expression-weighted ssGSEA.
 
-    One-time offline read of the training AnnData. Returns a [G] float32 vector
-    aligned to ``gene_names`` (missing genes -> 0). Used only when --ssgsea_mode
-    expression is requested.
+    One-time offline read of the AnnData. Returns a [G] float32 vector aligned to
+    ``gene_names`` (missing genes -> 0). Used only when --ssgsea_mode expression is
+    requested.
+
+    CAVEAT: this averages over EVERY cell in the file. The mask (and this weight) is
+    built once and shared across all training seeds, whereas training/eval split
+    80/20 per seed downstream, so these weights include the held-out eval cells of
+    every seed. That is a (small, symmetric) train/val leak into the PathPrior (RQ3)
+    fixed baseline. To avoid it, restrict this mean to a canonical train index set,
+    or use --ssgsea_mode equal (data-free). See docs/known_issues / audit notes.
     """
     import anndata as ad
     a = ad.read_h5ad(adata_path)
@@ -195,7 +204,8 @@ def build_ssgsea_weights(A_real, mean_expr=None):
     - equal (mean_expr=None): within-pathway equal weighting 1/k_p. The minimal,
       data-free proxy for MUPAD's fixed scoring.
     - expression (mean_expr given): within each pathway, weight a gene by its
-      train-set mean expression, normalised to sum to 1 over the pathway's genes.
+      full-panel mean expression (over all cells; see get_mean_expression caveat
+      re: eval-cell leakage), normalised to sum to 1 over the pathway's genes.
       This is the more faithful ssGSEA-style derivation flagged in
       implementation.md 3.2 / dev_log, capturing which genes actually drive each
       pathway's score rather than treating all members equally.
@@ -234,12 +244,19 @@ def main():
                              "gseapy (needs network).")
     parser.add_argument("--min_genes", type=int, default=3, help="Drop pathways with fewer hits.")
     parser.add_argument("--out_dir", default="data/pathway_masks")
-    parser.add_argument("--seed", type=int, default=42, help="Seed for the random mask variant.")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for the (shared) random mask variant.")
+    parser.add_argument("--rand_seeds", type=int, nargs='*', default=None,
+                        help="If given, ALSO write a per-seed random mask "
+                             "{prefix}_{db}_rand_s{seed}.npz for each seed so that "
+                             "randPath's multi-seed std reflects random-mask draw variance, "
+                             "not just optimization noise (RQ2). The shared "
+                             "{prefix}_{db}_rand.npz is still written for fallback.")
     parser.add_argument("--ssgsea_mode", default="expression", choices=["equal", "expression"],
                         help="PathPrior W_ssgsea derivation: 'equal' = within-pathway 1/k; "
                              "'expression' (default) = within-pathway weight proportional to "
-                             "train-set mean expression (closer to real ssGSEA). 'expression' "
-                             "needs --adata; falls back to 'equal' otherwise.")
+                             "full-panel mean expression over all cells (closer to real ssGSEA; "
+                             "includes held-out eval cells -- see get_mean_expression caveat). "
+                             "'expression' needs --adata; falls back to 'equal' otherwise.")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -269,7 +286,8 @@ def main():
     if args.ssgsea_mode == "expression":
         if args.adata is not None:
             mean_expr = get_mean_expression(args.adata, gene_names)
-            print(f"[{args.prefix}] W_ssgsea: expression-weighted (train-set mean expression)")
+            print(f"[{args.prefix}] W_ssgsea: expression-weighted (full-panel mean over ALL "
+                  f"cells; includes held-out eval cells -- see get_mean_expression caveat)")
         else:
             print(f"[{args.prefix}] W_ssgsea: --ssgsea_mode expression needs --adata; "
                   f"falling back to equal (1/k) weighting")
@@ -290,6 +308,19 @@ def main():
                         gene_names=gene_names_arr)
     np.savez_compressed(none_path, A=A_none, pathway_names=pathway_names_arr,
                         gene_names=gene_names_arr)
+
+    # Optional per-seed random masks: each randPath training seed then draws an
+    # INDEPENDENT random structure of matched per-pathway sparsity (deterministic per
+    # seed), so the reported 3-seed std includes random-mask draw variance. Derived
+    # from the same A_real; columns stay aligned to the panel gene order.
+    if args.rand_seeds:
+        for s in args.rand_seeds:
+            A_rand_s = make_random_mask(A_real, s)
+            assert A_rand_s.shape[1] == G, "per-seed rand mask G mismatch"
+            rand_s_path = os.path.join(args.out_dir, f"{args.prefix}_{args.db}_rand_s{s}.npz")
+            np.savez_compressed(rand_s_path, A=A_rand_s, pathway_names=pathway_names_arr,
+                                gene_names=gene_names_arr)
+            print(f"[{args.prefix}] wrote per-seed random mask (seed {s}): {rand_s_path}")
 
     print(f"[{args.prefix}] wrote:\n  {real_path}\n  {rand_path}\n  {none_path}")
     # Sanity: column count must equal panel size (alignment guarantee).

@@ -43,10 +43,20 @@ from src.dataset import (
 # from rectified.rectified_train_ddp import generate_images_with_rectified_flow
 from src.stain_normalization import normalize_staining_rgb_skimage_hist_match
 from rectified.utils import generate_images_with_rectified_flow
-from rectified.utils_uni2h import (
-    load_uni2_h_model, extract_uni2_h_embeddings, extended_biological_evaluation_uni2h,
-    calculate_uni2h_fid
-)
+# UNI2-h is an OPTIONAL pathology-FM metric. Its module pulls heavy deps (cv2, timm,
+# sklearn); guard the import so a missing dep degrades UNI2-h FID to N/A instead of
+# crashing the whole evaluation (basic FID/SSIM/PSNR are unaffected). Downstream calls
+# are already gated on `uni2h_model is not None`.
+try:
+    from rectified.utils_uni2h import (
+        load_uni2_h_model, extract_uni2_h_embeddings, extended_biological_evaluation_uni2h,
+        calculate_uni2h_fid
+    )
+except Exception as _uni2h_import_err:
+    load_uni2_h_model = extract_uni2_h_embeddings = extended_biological_evaluation_uni2h = calculate_uni2h_fid = None
+    logging.getLogger(__name__).warning(
+        f"UNI2-h eval unavailable (import failed: {_uni2h_import_err}); "
+        f"UNI2-h metrics -> N/A. Basic FID/SSIM/PSNR unaffected.")
 from rectified.utils_he2rna import *
 from rectified.utils_plot import save_all_evaluation_plots
 
@@ -291,11 +301,23 @@ def main():
     parser.add_argument('--batch_size', type=int, default=20, help='Per-GPU batch size for evaluation.')
     parser.add_argument('--max_samples', type=int, default=5000, help='Maximum number of samples to use from the dataset.')
     parser.add_argument('--use_ddp', action='store_true', help='Use Distributed Data Parallel evaluation.')
-    parser.add_argument('--he2rna_model_path', type=str, default='/depot/natallah/data/Mengbo/HnE_RNA/GeneFlow/sequoia/models/he2rna-skcm-0', 
-                           help='Path to pretrained HE2RNA model for RNA prediction validation')
+    parser.add_argument('--uni2h_model_path', type=str,
+                        default=os.environ.get('UNI2H_MODEL_PATH', '/depot/natallah/data/Mengbo/HnE_RNA/GeneFlow/UNI2-h'),
+                        help='Directory holding the UNI2-h foundation model pytorch_model.bin. '
+                             'Defaults to $UNI2H_MODEL_PATH, else the legacy authors-cluster path. '
+                             'Required for the biological UNI2-h FID metric; if the path is missing, '
+                             'UNI2-h FID is skipped and reported as NaN (basic FID/SSIM/PSNR unaffected).')
+    parser.add_argument('--he2rna_model_path', type=str,
+                        default=os.environ.get('HE2RNA_MODEL_PATH', '/depot/natallah/data/Mengbo/HnE_RNA/GeneFlow/sequoia/models/he2rna-skcm-0'),
+                        help='Path to pretrained HE2RNA model for RNA prediction validation. Defaults to $HE2RNA_MODEL_PATH.')
     parser.add_argument('--save_embeddings', action='store_true', default=True, help='Save UNI2-h embeddings for later analysis')
     parser.add_argument('--embeddings_output_path', type=str, default=None, help='Path to save embeddings (if None, saves to output_dir/embeddings)')
-    
+    # Debug/smoke: mirror rectified_main.py's --debug subset so eval reconstructs the SAME
+    # 80/10/10 split as a --debug training run (else eval splits the FULL dataset and its
+    # "test" chunk overlaps the debug training cells). Pass the SAME --debug_samples as training.
+    parser.add_argument('--debug', action='store_true', help='Subset the dataset to --debug_samples before the split (mirror a --debug training run).')
+    parser.add_argument('--debug_samples', type=int, default=1000, help='Number of samples in --debug mode (must match the training run).')
+
     parser = setup_parser(parser)
     args = parser.parse_args()
 
@@ -329,7 +351,10 @@ def main():
     np.random.seed(args.seed + rank)
 
     # Load UNI2-h model for biological validation and FID calculation
-    uni2h_model, uni2h_processor, uni2h_preprocess = load_uni2_h_model(device)
+    if load_uni2_h_model is not None:
+        uni2h_model, uni2h_processor, uni2h_preprocess = load_uni2_h_model(device, model_path=args.uni2h_model_path)
+    else:  # import guarded above (optional dep missing) -> UNI2-h path skipped
+        uni2h_model = uni2h_processor = uni2h_preprocess = None
     if rank == 0:
         if uni2h_model is not None:  # ← Check model, not processor
             logger.info("UNI2-h model loaded successfully for biological validation")
@@ -352,7 +377,7 @@ def main():
 
     if args.hest1k_base_dir:
         if args.hest1k_sid is None or len(args.hest1k_sid) == 0:
-            hest_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/data/HEST-1k/data/HEST_v1_1_0.csv")
+            hest_metadata = pd.read_csv(os.environ.get("HEST_METADATA_CSV", "/depot/natallah/data/Mengbo/HnE_RNA/data/HEST-1k/data/HEST_v1_1_0.csv"))
             args.hest1k_sid = hest_metadata[(hest_metadata['st_technology']=='Xenium') &
                                             (hest_metadata['species']=='Homo sapiens')]['id'].tolist()
         if rank == 0:
@@ -470,12 +495,28 @@ def main():
             cleanup_ddp()
         return
 
-    # Split into train and validation sets
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    _, eval_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(args.seed)  # Consistent split across ranks
+    # Debug/smoke: mirror rectified_main.py's debug subset (same seed + randperm) BEFORE the
+    # split, so the 80/10/10 partition reproduces the SAME test set as the --debug training
+    # run (otherwise eval splits the full dataset and its test chunk won't match).
+    if getattr(args, 'debug', False):
+        _dbg_idx = torch.randperm(len(full_dataset),
+                                  generator=torch.Generator().manual_seed(args.seed))[:args.debug_samples]
+        full_dataset = torch.utils.data.Subset(full_dataset, _dbg_idx)
+        if rank == 0:
+            logger.info(f"DEBUG MODE: subset full_dataset to {len(full_dataset)} samples "
+                        f"(mirroring training) before the split.")
+
+    # FIX (2026-07): evaluate on the held-out TEST split (80/10/10), NOT the
+    # validation set used for checkpoint selection. This split MUST match
+    # rectified_main.py exactly (same lengths, same seed) so the test set here is the
+    # same 10% that was held out (never trained on, never used to pick the checkpoint).
+    n_total = len(full_dataset)
+    train_size = int(0.8 * n_total)
+    val_size = int(0.1 * n_total)
+    test_size = n_total - train_size - val_size
+    _, _, eval_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(args.seed)  # same split as training
     )
 
     if len(eval_dataset) == 0:
@@ -595,6 +636,16 @@ def main():
         resblock_updown=True, use_new_attention_order=True,
         concat_mask=model_config_ckpt.get('concat_mask', getattr(args, 'concat_mask', False)),
         relation_rank=model_config_ckpt.get('relation_rank', getattr(args, 'relation_rank', 50)),
+        # Build the RNA (geneflow) encoder with the checkpoint's ablation flags (read above),
+        # not the constructor's hardcoded all-True defaults. No-op on the 54-run (all True),
+        # but correct if an RNA-flag ablation checkpoint is ever evaluated. Ignored by the
+        # pathway encoder. (main.py persists these in model_config; see rectified_main.py:720.)
+        use_gene_attention=use_gene_attention,
+        use_multi_head_attention=use_multi_head_attention,
+        use_feature_gating=use_feature_gating,
+        use_residual_blocks=use_residual_blocks,
+        use_layer_norm=use_layer_norm,
+        use_gene_relations=use_gene_relations,
     )
 
     # Pathway encoder support: rebuild the same encoder used at train time.
@@ -674,6 +725,14 @@ def main():
     except Exception as e:
         if cross_eval:
             # Do not silently fall back to a same-panel load for cross-dataset eval.
+            raise
+        if encoder_type == 'pathway':
+            # Never fall back to the RNA constructors for a pathway (Gene2Image /
+            # ablation) checkpoint. The feature-detection path below only builds RNA
+            # encoders, so strict=False would drop every pathway weight and silently
+            # evaluate a RANDOM-init encoder, reporting garbage metrics under the
+            # variant's name (multi-cell) or aborting with no metrics (single-cell).
+            # Fail loudly so the real load error surfaces.
             raise
         if rank == 0:
             logger.warning(f"Failed to load model with current constructor: {e}")
@@ -814,7 +873,17 @@ def main():
 
     # Initialize evaluation components
     rectified_flow = RectifiedFlow(sigma_min=0.002, sigma_max=80.0)
-    inception_model = InceptionModel(device)
+    # Inception-v3 (ImageNet) backs FID; torchvision downloads its weights on first use.
+    # On an OFFLINE compute node that raises URLError -> guard it so a missing FID never
+    # crashes the whole eval (SSIM/PSNR/UNI2-h still computed). Pre-fetch on a login node.
+    try:
+        inception_model = InceptionModel(device)
+    except Exception as _inception_err:
+        inception_model = None
+        logger.warning(
+            f"Inception-v3 unavailable ({_inception_err}); overall_fid will be NaN. Pre-fetch on a "
+            f"login node: python -c \"import torchvision.models as m; m.inception_v3(weights='IMAGENET1K_V1')\" "
+            f"or set TORCH_HOME to a cached copy.")
 
     # Storage for metrics
     all_ssim_scores = []
@@ -862,7 +931,8 @@ def main():
 
                 generated_images_tensor = generate_images_with_rectified_flow(
                     model, rectified_flow, gene_expr, device, args.gen_steps,
-                    gene_mask=gene_mask, is_multi_cell=False
+                    gene_mask=gene_mask, is_multi_cell=False,
+                    sample_ids=sample_ids_in_batch
                 )
             else:  # multi-cell
                 processed_batch = prepare_multicell_batch(batch, device)
@@ -875,7 +945,8 @@ def main():
 
                 generated_images_tensor = generate_images_with_rectified_flow(
                     model, rectified_flow, gene_expr, device, args.gen_steps,
-                    num_cells=num_cells_info, gene_mask=gene_mask, is_multi_cell=True
+                    num_cells=num_cells_info, gene_mask=gene_mask, is_multi_cell=True,
+                    sample_ids=sample_ids_in_batch
                 )
 
             # Apply stain normalization if enabled
@@ -938,41 +1009,41 @@ def main():
             all_ssim_scores.extend(ssim_scores)
             all_psnr_scores.extend(psnr_scores)
 
-            # Extract features for traditional FID calculation
-            real_features = inception_model(real_images_tensor).cpu().numpy()
-            gen_features = inception_model(generated_images_tensor).cpu().numpy()
-            all_real_features_for_fid.append(real_features)
-            all_gen_features_for_fid.append(gen_features)
-
+            # Extract features for traditional FID (skip gracefully if Inception unavailable offline).
+            # PERF (opt A): FID is computed ONCE at the end from the accumulated FULL-set
+            # features (overall_fid). We no longer compute a per-batch FID here: with
+            # batch_size ~8 and 2048-d Inception features the per-batch covariance is
+            # rank-deficient (statistically invalid), and the per-batch scipy.linalg.sqrtm
+            # was the single biggest eval cost. We keep only the cheap per-sample feature
+            # L2 distance (for the progress bar and the per-sample CSV).
             per_sample_feat_dists = []
-            if real_features.shape[0] > 0: # Ensure batch is not empty
+            if inception_model is not None:
+                real_features = inception_model(real_images_tensor).cpu().numpy()
+                gen_features = inception_model(generated_images_tensor).cpu().numpy()
+                all_real_features_for_fid.append(real_features)
+                all_gen_features_for_fid.append(gen_features)
                 for i in range(real_features.shape[0]):
-                    r_feat = real_features[i]
-                    g_feat = gen_features[i]
-                    distance = np.linalg.norm(r_feat - g_feat)
-                    per_sample_feat_dists.append(distance)
-
-            # Calculate batch-wise traditional FID
-            batch_fid = calculate_fid(real_features, gen_features)
+                    per_sample_feat_dists.append(float(np.linalg.norm(real_features[i] - gen_features[i])))
+            batch_fid = np.nan  # per-batch FID removed; see overall_fid at end of eval
             all_batch_fids_list.append(batch_fid)
 
-            # UNI2-h FID calculation (optional: skipped if model unavailable).
+            # UNI2-h embeddings (optional: skipped if model unavailable).
+            # PERF (opt B): extract the ViT-H embeddings ONCE per batch (real + generated)
+            # and accumulate them; the UNI2-h FID is computed ONCE at the end
+            # (overall_uni2h_fid) from the full set. This drops the old per-batch
+            # calculate_uni2h_fid, which redundantly ran TWO more ViT-H forward passes
+            # (it re-extracts internally) plus a per-batch sqrtm on a rank-deficient batch.
             if uni2h_model is None:
-                uni2h_fid = np.nan
                 real_uni2h_features = None
                 gen_uni2h_features = None
             else:
-                uni2h_fid = calculate_uni2h_fid(
-                    real_images_tensor, generated_images_tensor,
-                    uni2h_model, uni2h_processor, uni2h_preprocess, device
-                )
-                # Extract and store UNI2-h features for overall FID calculation
                 real_uni2h_features = extract_uni2_h_embeddings(
                     real_images_tensor, uni2h_model, uni2h_processor, uni2h_preprocess, device
                 )
                 gen_uni2h_features = extract_uni2_h_embeddings(
                     generated_images_tensor, uni2h_model, uni2h_processor, uni2h_preprocess, device
                 )
+            uni2h_fid = np.nan  # per-batch UNI2-h FID removed; see overall_uni2h_fid at end
             all_uni2h_fids_list.append(uni2h_fid)
 
             # Store embeddings with metadata for saving
@@ -1036,11 +1107,13 @@ def main():
 
             # Update progress bar (only on rank 0)
             if rank == 0:
+                # FID / UNI2-h FID are computed ONCE at the end from the full set, so the
+                # per-batch values are no longer available for the bar; show the cheap
+                # per-batch Inception feature-distance as a live progress signal instead.
                 postfix_dict = {
                     'Avg SSIM': f'{np.mean(all_ssim_scores):.4f}',
                     'Avg PSNR': f'{np.mean(all_psnr_scores):.4f}',
-                    'Inception FID': f'{batch_fid:.2f}' if not np.isnan(batch_fid) else 'N/A',
-                    'UNI2-h FID': f'{uni2h_fid:.2f}' if not np.isnan(uni2h_fid) else 'N/A'
+                    'FeatDist(batch)': f'{np.mean(per_sample_feat_dists):.3f}' if per_sample_feat_dists else 'N/A',
                 }
 
                 # Add RNA correlation if available
@@ -1113,26 +1186,57 @@ def main():
     if rank == 0:
         logger.info("Computing final evaluation metrics...")
         
-        # Calculate overall traditional FID
-        all_real_features_concat = np.concatenate(all_real_features_for_fid, axis=0)
-        all_gen_features_concat = np.concatenate(all_gen_features_for_fid, axis=0)
-        overall_fid = calculate_fid(all_real_features_concat, all_gen_features_concat)
+        # Calculate overall traditional FID (NaN if Inception was unavailable -> no features)
+        if all_real_features_for_fid and all_gen_features_for_fid:
+            all_real_features_concat = np.concatenate(all_real_features_for_fid, axis=0)
+            all_gen_features_concat = np.concatenate(all_gen_features_for_fid, axis=0)
+            # Drop non-finite feature rows (independently per set) so one NaN generated
+            # image can't make the covariance -> sqrtm NaN and void overall_fid.
+            _rfin = np.isfinite(all_real_features_concat).all(axis=1)
+            _gfin = np.isfinite(all_gen_features_concat).all(axis=1)
+            if not (_rfin.all() and _gfin.all()):
+                logger.warning(f"Dropped non-finite feature rows before FID "
+                               f"(real: {int((~_rfin).sum())}, gen: {int((~_gfin).sum())}).")
+                all_real_features_concat = all_real_features_concat[_rfin]
+                all_gen_features_concat = all_gen_features_concat[_gfin]
+            overall_fid = calculate_fid(all_real_features_concat, all_gen_features_concat)
+        else:
+            overall_fid = float('nan')
 
-        # Calculate overall UNI2-h FID
+        # Calculate overall UNI2-h FID (same non-finite row filter as Inception FID above,
+        # so one bad embedding drops a row instead of voiding the whole variant's UNI2h-FID)
         try:
             all_real_uni2h_features_concat = np.concatenate(all_real_uni2h_features_for_fid, axis=0)
             all_gen_uni2h_features_concat = np.concatenate(all_gen_uni2h_features_for_fid, axis=0)
+            _ru = np.isfinite(all_real_uni2h_features_concat).all(axis=1)
+            _gu = np.isfinite(all_gen_uni2h_features_concat).all(axis=1)
+            if not (_ru.all() and _gu.all()):
+                logger.warning(f"Dropped non-finite UNI2-h feature rows before FID "
+                               f"(real: {int((~_ru).sum())}, gen: {int((~_gu).sum())}).")
+                all_real_uni2h_features_concat = all_real_uni2h_features_concat[_ru]
+                all_gen_uni2h_features_concat = all_gen_uni2h_features_concat[_gu]
             overall_uni2h_fid = calculate_fid(all_real_uni2h_features_concat, all_gen_uni2h_features_concat)
             logger.info(f"Overall UNI2-h FID calculated from {all_real_uni2h_features_concat.shape[0]} samples")
         except Exception as e:
             logger.warning(f"Could not compute overall UNI2-h FID: {e}")
             overall_uni2h_fid = np.nan
         
-        # Calculate mean metrics
-        mean_ssim = np.mean(all_ssim_scores)
-        mean_psnr = np.mean(all_psnr_scores)
-        std_ssim = np.std(all_ssim_scores)
-        std_psnr = np.std(all_psnr_scores)
+        # Calculate mean metrics. Filter non-finite per-sample values first: a single
+        # NaN/inf generated image (e.g. a diverged cell) would otherwise make np.mean NaN
+        # and void the entire variant's SSIM/PSNR (np.clip/torch.clamp do NOT remove NaN).
+        # Matches the NaN filtering already done for FID / feature-distance below.
+        _ssim_arr = np.asarray(all_ssim_scores, dtype=float)
+        _psnr_arr = np.asarray(all_psnr_scores, dtype=float)
+        _ssim_ok = _ssim_arr[np.isfinite(_ssim_arr)]
+        _psnr_ok = _psnr_arr[np.isfinite(_psnr_arr)]
+        _n_bad = (len(_ssim_arr) - len(_ssim_ok)) + (len(_psnr_arr) - len(_psnr_ok))
+        if _n_bad > 0:
+            logger.warning(f"Dropped {_n_bad} non-finite SSIM/PSNR value(s) before averaging "
+                           f"(SSIM: {len(_ssim_arr) - len(_ssim_ok)}, PSNR: {len(_psnr_arr) - len(_psnr_ok)}).")
+        mean_ssim = float(np.mean(_ssim_ok)) if len(_ssim_ok) else float('nan')
+        mean_psnr = float(np.mean(_psnr_ok)) if len(_psnr_ok) else float('nan')
+        std_ssim = float(np.std(_ssim_ok)) if len(_ssim_ok) else float('nan')
+        std_psnr = float(np.std(_psnr_ok)) if len(_psnr_ok) else float('nan')
 
         all_feat_dists = [item['inception_feature_distance'] for item in per_sample_metrics_list if not np.isnan(item.get('inception_feature_distance', np.nan))]
         feat_dist_mean, feat_dist_std = (np.mean(all_feat_dists), np.std(all_feat_dists)) if all_feat_dists else (np.nan, np.nan)
@@ -1152,7 +1256,13 @@ def main():
                             if k not in ['batch_idx', 'rank', 'batch_size', 'uni2h_fid', 'inception_fid']]
             
             for key in biological_keys:
-                values = [r[key] for r in all_biological_results if r[key] is not None and not np.isnan(r[key])]
+                # Guard `key in r`: nuclear_*/spatial_* keys are only present in batches that
+                # actually segmented nuclei, so a later batch (e.g. a blurry ablation image ->
+                # 0 regions) can omit a key that batch 0 had. Without this guard r[key] raises
+                # KeyError and crashes the whole eval BEFORE evaluation_summary.json is written
+                # (losing the run's FID/SSIM/PSNR and, under set -e, aborting the matrix).
+                values = [r[key] for r in all_biological_results
+                          if key in r and r[key] is not None and not np.isnan(r[key])]
                 if values:
                     biological_summary[f'mean_{key}'] = float(np.mean(values))
                     biological_summary[f'std_{key}'] = float(np.std(values))
@@ -1169,6 +1279,8 @@ def main():
         # results summary
         results_summary = {
             'total_samples': len(all_ssim_scores),
+            'n_ssim_used': int(len(_ssim_ok)),  # finite samples the SSIM mean/std were computed over
+            'n_psnr_used': int(len(_psnr_ok)),  # finite samples the PSNR mean/std were computed over
             'mean_ssim': float(mean_ssim),
             'std_ssim': float(std_ssim),
             'mean_psnr': float(mean_psnr),
@@ -1277,9 +1389,8 @@ def main():
         logger.info(f"Total samples evaluated: {len(all_ssim_scores)}")
         logger.info(f"SSIM: {mean_ssim:.4f} ± {std_ssim:.4f}")
         logger.info(f"PSNR: {mean_psnr:.4f} ± {std_psnr:.4f}")
-        logger.info(f"Inception FID: {overall_fid:.4f}")
-        logger.info(f"UNI2-H FID (batch-wise mean): {mean_uni2h_fid:.4f}")
-        logger.info(f"UNI2-H FID (overall): {overall_uni2h_fid:.4f}")
+        logger.info(f"Inception FID (overall, full-set): {overall_fid:.4f}")
+        logger.info(f"UNI2-H FID (overall, full-set): {overall_uni2h_fid:.4f}")
         logger.info("-" * 40)
         logger.info("BIOLOGICAL VALIDATION RESULTS:")
         logger.info("-" * 40)
