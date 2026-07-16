@@ -28,7 +28,7 @@
 #   SEEDS="42 43 44"     EPOCHS=50   BATCH_SIZE=16  EVAL_BATCH=8  GEN_STEPS=100  WORKERS=4
 #   INCLUDE_CROSS=1  INCLUDE_INTERPRET=1  INCLUDE_REACTOME=0  INTERPRET_SEED=42
 #   DATA_ROOT=data/processed_data  MASK_DIR=data/pathway_masks  OUT_ROOT=results
-#   EXTRA="--use_amp"   PY=python
+#   EXTRA="--use_amp --patience 9999"   PY=python      # 9999 = early stopping off (equal budget)
 #   OFFLINE pathway masks (no Enrichr/network): point these at local .gmt files
 #     GMT_HALLMARK=/path/h.all.v2023.2.Hs.symbols.gmt
 #     GMT_REACTOME=/path/c2.cp.reactome.v2023.2.Hs.symbols.gmt   (only for INCLUDE_REACTOME=1)
@@ -70,7 +70,13 @@ BATCH_SIZE=${BATCH_SIZE:-16}
 EVAL_BATCH=${EVAL_BATCH:-8}
 GEN_STEPS=${GEN_STEPS:-100}
 WORKERS=${WORKERS:-4}
-EXTRA=${EXTRA:-"--use_amp"}
+# --patience 9999 = early stopping OFF, which the cross-variant comparison REQUIRES. GeneFlow's
+# train.sh sets PATIENCE=5 and we follow it on the other four hyper-parameters (batch 16 /
+# 50 epochs / lr 1e-4 / wd 0.01), but with patience=5 each arm stops at a different epoch
+# (previous batch: gene2image ~26.6 vs geneflow ~14.9), confounding the encoder comparison with
+# training budget -- one of the four reasons that batch was binned. Best checkpoint is still the
+# val_mse minimum, so a full budget only widens the search for every arm, including the baseline.
+EXTRA=${EXTRA:-"--use_amp --patience 9999"}
 EVAL_EXTRA=${EVAL_EXTRA:-}   # eval has no --use_amp; keep eval extras separate from train
 
 DATASETS=${DATASETS:-"c1 c2 p1"}
@@ -84,6 +90,13 @@ INCLUDE_INTERPRET=${INCLUDE_INTERPRET:-1}
 INCLUDE_REACTOME=${INCLUDE_REACTOME:-0}
 INTERPRET_SEED=${INTERPRET_SEED:-42}
 DRY_RUN=${DRY_RUN:-0}
+# MASKS_ONLY=1 -> build + verify pathway masks, then exit BEFORE any train/eval job is
+# queued. This is what a "prep" job wants. Do NOT emulate it with VARIANTS="": the
+# cross-dataset block in build_train_jobs is gated on INCLUDE_CROSS, NOT on VARIANTS, so
+# an empty VARIANTS still queues 3 CROSS_PAIRS x 3 SEEDS = 9 full 50-epoch trainings
+# (run_cross_dataset.sh trains the source panel). On a 30-min prep job those get SIGKILLed,
+# prep exits non-zero, and an array submitted with --dependency=afterok never launches.
+MASKS_ONLY=${MASKS_ONLY:-0}
 
 # RQ4 interpret runs on a SINGLE seed's checkpoint (INTERPRET_SEED). If that seed
 # is not in SEEDS, its checkpoint is never trained and interpret would silently
@@ -415,6 +428,17 @@ echo "############################################################"
 
 write_catalog
 run_prereqs
+
+# Prep path: masks are built (PHASE 0) and asserted present (PHASE 0.5), then stop.
+# Nothing below this point may run, or a "30-minute prep" silently becomes a multi-day
+# training queue. verify_masks here covers every mask the full 54-run will load, because
+# a prep job is expected to pass the real VARIANTS/DATASETS/SEEDS.
+if [ "$MASKS_ONLY" = "1" ]; then
+  verify_masks
+  echo "=== MASKS_ONLY=1: masks built + verified; skipping ALL train/eval/interpret jobs. ==="
+  echo "[ok] masks-only prep done"
+  exit 0
+fi
 
 build_train_jobs
 build_interpret_jobs

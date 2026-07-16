@@ -36,5 +36,9 @@ EPOCHS="${EPOCHS:-3}" BATCH_SIZE=16 EVAL_BATCH=8 GEN_STEPS=50 WORKERS=14 \
 EXTRA="--use_amp --patience 9999 --auto_resume --debug --debug_samples 256" \
 EVAL_EXTRA="--debug --debug_samples 256" \
   bash scripts/run_experiments.sh "$VARIANT" "$DS" "$SEED"
-python scripts/validate_runs.py --results_root "$OUTPUT_DIR" --expected_epochs "${EPOCHS:-3}" --patience 9999 || true
+# Scope the gate to the ONE run this smoke actually trained. Without --variants/--datasets/
+# --seeds it audits the full 6x3x3 grid and prints 53 "run directory missing (never launched)"
+# FAILs — pure noise for a smoke test, and easy to misread as a real failure.
+python scripts/validate_runs.py --results_root "$OUTPUT_DIR" --expected_epochs "${EPOCHS:-3}" --patience 9999 \
+  --variants "$VARIANT" --datasets "$DS" --seeds "$SEED" || true
 echo "=== [ok] smoke done at $(date) ==="

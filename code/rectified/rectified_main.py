@@ -33,6 +33,13 @@ from src.dataset import (
 from rectified.rectified_train import train_with_rectified_flow, generate_images_with_rectified_flow
 
 
+# Stamped into every checkpoint and verified before --auto_resume continues one. Bump this whenever
+# a change makes older checkpoints unsafe to continue (protocol, selection rule, mask semantics).
+# The point is that resuming the DISCARDED batch is otherwise silent: same run-dir names, same
+# --auto_resume default, and validate_runs.py would report the laundered run as "full budget 50/50".
+PROTOCOL_TAG = "v10-patience9999-valmse"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train and evaluate RNA to H&E cell image generator with Rectified Flow.")
     
@@ -554,6 +561,8 @@ def main():
     checkpoint_path = os.path.join(args.output_dir, "training_checkpoint.pt")
     start_epoch = 0
     best_val_loss = float('inf')
+    resume_es_counter = 0      # early-stop plateau count carried across --auto_resume
+    resume_es_done = False     # True if the checkpoint says training already early-stopped
 
     # Load checkpoint if it exists (only on rank 0, then broadcast)
     checkpoint_to_load = None
@@ -582,8 +591,51 @@ def main():
         # Load the checkpoint if one was found
         if checkpoint_to_load is not None:
             checkpoint_state = torch.load(checkpoint_to_load, weights_only=False)
+
+            # PROTOCOL GUARD -- refuse to silently continue a checkpoint from a different protocol.
+            #
+            # The run directory name (<variant>_<ds>_seed<seed>) is byte-identical to the one the
+            # DISCARDED previous batch used, and --auto_resume is the array's default. So if that
+            # invalid batch's results/ is still on the cluster, every task would resume its
+            # epoch-2-5 weights, train on to 50, and report "reached full budget 50/50" -- an
+            # invalid batch laundered into a clean-looking one.
+            #
+            # It is worse than stale weights for randpath: pathway_encoder registers the mask as a
+            # BUFFER, so the load_state_dict below overwrites the freshly built per-seed mask with
+            # the checkpoint's, and because the random masks preserve each pathway's gene count the
+            # shapes match and the load succeeds silently -- collapsing RQ2's per-seed mask variance
+            # behind the back of run_experiments.sh's exit 105 guard.
+            _proto = checkpoint_state.get('protocol')
+            if _proto != PROTOCOL_TAG:
+                logger.error(
+                    f"[FATAL] refusing to resume {checkpoint_to_load}: it was written under "
+                    f"protocol {_proto!r}, this run is {PROTOCOL_TAG!r}.")
+                logger.error(
+                    "        A checkpoint from another protocol (e.g. the discarded batch) would be "
+                    "resumed silently and reported as a full-budget run; for randpath it would also "
+                    "overwrite the per-seed pathway mask, which is registered as a buffer.")
+                logger.error(
+                    "        Move the old results aside (mv results results_INVALID_$(date +%F)) and "
+                    "relaunch, or delete this run's checkpoints/ to start it fresh.")
+                sys.exit(106)
+
             start_epoch = checkpoint_state['epoch'] + 1  # Start from next epoch
             best_val_loss = checkpoint_state.get('best_val_loss', float('inf'))
+            # Early-stop state (absent in checkpoints written before this was persisted -> 0/False,
+            # i.e. the old restart-from-zero behaviour, so old checkpoints still load).
+            resume_es_counter = int(checkpoint_state.get('early_stop_counter', 0) or 0)
+            resume_es_done = bool(checkpoint_state.get('early_stopped', False))
+            if resume_es_done:
+                # Training already ended by early stopping. Without this guard --auto_resume would
+                # restart at start_epoch with a zeroed counter and keep training to num_epochs,
+                # making the realized epoch count depend on preemption timing rather than on the
+                # validation curve -- and differently for each variant, which is exactly the
+                # unequal-training-budget confound that invalidated the previous 54-run batch.
+                start_epoch = args.epochs
+                logger.info(f"Checkpoint says training already early-stopped at epoch "
+                            f"{checkpoint_state['epoch']} (counter {resume_es_counter}/"
+                            f"{checkpoint_state.get('early_stop_patience', '?')}); skipping further "
+                            f"training and proceeding to evaluation.")
             
             # Load model state
             model_state_dict = checkpoint_state.get('model_state_dict', checkpoint_state.get('model'))
@@ -622,9 +674,11 @@ def main():
 
     # Broadcast checkpoint info to all ranks
     if args.use_ddp:
-        checkpoint_info = torch.tensor([start_epoch, best_val_loss], device=device)
+        # resume_es_counter rides along so non-zero ranks inherit the plateau count too.
+        checkpoint_info = torch.tensor([start_epoch, best_val_loss, float(resume_es_counter)], device=device)
         dist.broadcast(checkpoint_info, src=0)
         start_epoch, best_val_loss = int(checkpoint_info[0].item()), float(checkpoint_info[1].item())
+        resume_es_counter = int(checkpoint_info[2].item())
 
     # Train model
     resuming_same_dir = False
@@ -674,15 +728,17 @@ def main():
         logger.info("Resuming from same directory, using existing checkpoints")
 
     if args.use_ddp:
-        checkpoint_info = torch.tensor([start_epoch, best_val_loss], device=device)
+        # resume_es_counter rides along so non-zero ranks inherit the plateau count too.
+        checkpoint_info = torch.tensor([start_epoch, best_val_loss, float(resume_es_counter)], device=device)
         dist.broadcast(checkpoint_info, src=0)
         start_epoch, best_val_loss = int(checkpoint_info[0].item()), float(checkpoint_info[1].item())
+        resume_es_counter = int(checkpoint_info[2].item())
 
     # Train model
     best_model_path = os.path.join(args.output_dir, f"best_{args.model_type}_rna_to_hne_model_rectified.pt")
 
     if not getattr(args, 'only_inference', False):
-        train_losses, val_losses = train_with_rectified_flow(
+        train_losses, val_losses, best_val_loss = train_with_rectified_flow(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -698,6 +754,8 @@ def main():
             is_multi_cell=(args.model_type == 'multi'),
             start_epoch=start_epoch,
             best_val_loss=best_val_loss,
+            early_stop_counter=resume_es_counter,
+            protocol_tag=PROTOCOL_TAG,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
             checkpoint_path=checkpoint_path,
@@ -755,6 +813,20 @@ def main():
 
         if rank == 0:
             logger.info(f"Training complete. Best model saved at {best_model_path}")
+            # Machine-readable training summary, so a run can be audited from the LOG ALONE.
+            # epochs_this_invocation counts only what THIS process ran: after an --auto_resume it is
+            # the final segment, not the run's total, which is why last_epoch (1-based, cumulative)
+            # is reported alongside it. The paper reports the realized stop epoch beside the
+            # metrics, so this is the log-side source for it.
+            logger.info(
+                "TRAIN_GATES "
+                f"epochs_this_invocation={len(train_losses)} "
+                f"last_epoch={start_epoch + len(train_losses)} "
+                f"budget={args.epochs} "
+                f"patience={args.patience} "
+                f"resumed_from_epoch={start_epoch if start_epoch else 0} "
+                f"best_val_mse={best_val_loss:.6g}"
+            )
 
             # Plot training curves
             plt.figure(figsize=(12, 5))
@@ -787,14 +859,26 @@ def main():
             plt.tight_layout()
             plt.savefig(os.path.join(args.output_dir, "training_curves.png"), dpi=300, bbox_inches='tight')
             
-            # Save loss values to CSV for further analysis
-            loss_df = pd.DataFrame({
-                'epoch': range(1, len(train_losses) + 1),
-                'train_loss': train_losses,
-                'val_loss': val_losses
-            })
-            loss_df.to_csv(os.path.join(args.output_dir, "training_losses.csv"), index=False)
-            logger.info(f"Training curves and loss data saved to {args.output_dir}")
+            # Save loss values to CSV for further analysis.
+            # train_losses only ever holds THIS invocation's epochs. When the training loop runs
+            # zero epochs -- which is exactly what happens when SLURM requeues a job whose training
+            # had already finished (--auto_resume sets start_epoch > num_epochs, so range() is
+            # empty, e.g. preemption during the ~3h eval) -- an unconditional write would replace
+            # the real history with a header-only file. validate_runs.py reads this CSV's row count
+            # as the epochs reached, so that would turn a complete run into a "TRUNCATED" failure
+            # and there is no way to recover the numbers afterwards.
+            _csv_path = os.path.join(args.output_dir, "training_losses.csv")
+            if train_losses:
+                loss_df = pd.DataFrame({
+                    'epoch': range(1, len(train_losses) + 1),
+                    'train_loss': train_losses,
+                    'val_loss': val_losses
+                })
+                loss_df.to_csv(_csv_path, index=False)
+                logger.info(f"Training curves and loss data saved to {args.output_dir}")
+            else:
+                logger.info(f"No epochs ran in this invocation (resumed past the budget); keeping "
+                            f"the existing {_csv_path} instead of overwriting it with an empty file.")
 
     else:
         if rank == 0:

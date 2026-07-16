@@ -20,7 +20,13 @@ CKPT_DIR="${CKPT_DIR:-$OUTPUT_DIR}"                    # ckpts: $OUTPUT_DIR/<run
 GMT_HALLMARK="${GMT_HALLMARK:-$PROJECT_DIR/../gmt/msigdb_2023.2_Hs/h.all.v2023.2.Hs.symbols.gmt}"
 
 # Model weights / caches / logging
-export UNI2H_MODEL_PATH="${UNI2H_MODEL_PATH:-}"        # gated MahmoodLab/UNI2-h dir (pytorch_model.bin); unset -> UNI2-h FID = NaN
+# UNI2-h (gated MahmoodLab/UNI2-h dir holding pytorch_model.bin). PIN the default here:
+# an empty default is how the previous 54-run batch was invalidated. sbatch defaults to
+# --export=ALL, so the value only ever reached a job because it happened to be exported in
+# the submit shell; submitting from a fresh login, a wrapper script, or --export=NONE left
+# it empty, utils_uni2h caught the FileNotFoundError, logged a WARNING, returned None, and
+# rectified_evaluate wrote overall_uni2h_fid = NaN -- with exit code 0. Fails-fast below.
+export UNI2H_MODEL_PATH="${UNI2H_MODEL_PATH:-$PROJECT_DIR/../../models/UNI2-h}"
 export HE2RNA_MODEL_PATH="${HE2RNA_MODEL_PATH:-}"
 export HF_HOME="${HF_HOME:-$PROJECT_DIR/.cache/hf}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME}"
@@ -45,6 +51,16 @@ source "$VENV_DIR/bin/activate"
 # ---------- Safety checks + dirs ----------
 [ -d "$PROJECT_DIR" ] || { echo "[FATAL] PROJECT_DIR missing: $PROJECT_DIR"; exit 1; }
 [ -d "$DATA_DIR" ]    || { echo "[FATAL] DATA_DIR missing: $DATA_DIR (download Zenodo 17429142)"; exit 1; }
+# UNI2-h fail-fast: refuse to start rather than burn ~40h/run and report NaN biological
+# FID on all 54 runs -- the exact failure that invalidated the previous batch, which the
+# validity gate did not catch. Set ALLOW_NO_UNI2H=1 to deliberately run without it.
+if [ "${ALLOW_NO_UNI2H:-0}" != "1" ] && [ ! -f "$UNI2H_MODEL_PATH/pytorch_model.bin" ]; then
+  echo "[FATAL] UNI2-h weights not found: $UNI2H_MODEL_PATH/pytorch_model.bin"
+  echo "        Biological FID would be NaN on every run and the job would still exit 0."
+  echo "        Fix: export UNI2H_MODEL_PATH=/path/to/UNI2-h  (dir containing pytorch_model.bin)"
+  echo "        Or:  ALLOW_NO_UNI2H=1 to run anyway WITHOUT biological FID."
+  exit 104
+fi
 cd "$PROJECT_DIR"
 mkdir -p logs outputs "$MASK_DIR" "$OUTPUT_DIR" "$HF_HOME"
 
@@ -53,7 +69,7 @@ echo "host=$(hostname)  SLURM_JOB_ID=${SLURM_JOB_ID:-<none>}  task=${SLURM_ARRAY
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "PROJECT_DIR=$PROJECT_DIR"
 echo "DATA_DIR=$DATA_DIR  OUTPUT_DIR=$OUTPUT_DIR  CKPT_DIR=$CKPT_DIR"
-echo "UNI2H_MODEL_PATH=${UNI2H_MODEL_PATH:-<unset -> UNI2-h FID = NaN>}"
+echo "UNI2H_MODEL_PATH=$UNI2H_MODEL_PATH  (weights verified present)"
 echo "============================================================"
 
 # ---------- GPU fail-fast (never silently fall back to CPU) ----------

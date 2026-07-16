@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import torch
 import logging
 from tqdm import tqdm
@@ -101,6 +102,14 @@ def train_with_rectified_flow(
     is_multi_cell=False,
     start_epoch=0,
     best_val_loss=float('inf'),
+    # Early-stop state carried across --auto_resume. Without it the counter restarts at 0 on every
+    # resume, so a preempted run would need `patience` fresh non-improving epochs before it could
+    # stop again, making the realized epoch count a function of how often SLURM preempted the job
+    # rather than of the validation curve. INERT under the formal protocol (--patience 9999 means no
+    # early stop ever fires), and kept deliberately: it costs nothing, and it is what makes a
+    # smaller patience safe to use should anyone ever want one.
+    early_stop_counter=0,
+    protocol_tag=None,   # stamped into checkpoints; --auto_resume refuses a mismatch
     optimizer=None,
     lr_scheduler=None,
     checkpoint_path=None,
@@ -180,9 +189,11 @@ def train_with_rectified_flow(
     train_losses, val_losses = [], []
 
     # Early stopping variables
-    counter = 0
+    counter = early_stop_counter   # resumed value, so a preempted run keeps its plateau history
     early_stop = False
     current_patience = patience
+    if counter:
+        logger.info(f"Resumed early-stopping counter at {counter}/{patience}")
     
     spatial_loss_was_active = False
 
@@ -296,7 +307,37 @@ def train_with_rectified_flow(
             if rank == 0:
                 logger.info(f"Resuming with original LR schedule (T_max={num_epochs})")
 
+    # ---- efficiency instrumentation (paper's 编码效率表) ---------------------------------------
+    # Params / effective-edge count / per-epoch time / peak VRAM are ALL only observable while the
+    # run is happening: none of them can be recovered from a checkpoint afterwards. The paper
+    # promises this table, so emit it here rather than discovering after 1800 GPU-hours that four of
+    # its five columns have no source.
+    if rank == 0:
+        _m = model.module if isinstance(model, DDP) else model
+        _total = sum(p.numel() for p in _m.parameters() if p.requires_grad)
+        _frozen = sum(p.numel() for p in _m.parameters() if not p.requires_grad)
+        _enc = getattr(_m, 'rna_encoder', None) or getattr(_m, 'encoder', None)
+        _enc_n = sum(p.numel() for p in _enc.parameters() if p.requires_grad) if _enc is not None else -1
+        # Effective edges: pathway_encoder registers the edge list as buffers and stores its size
+        # in .E; -1 for the geneflow arm, which has no pathway mask.
+        _edges = -1
+        for _mod in _m.modules():
+            if hasattr(_mod, 'E') and hasattr(_mod, 'edge_p'):
+                _edges = int(_mod.E)
+                break
+        logger.info(
+            "MODEL_STATS "
+            f"encoder_trainable_params={_enc_n} "
+            f"total_trainable_params={_total} "
+            f"frozen_params={_frozen} "
+            f"effective_edges={_edges}"
+        )
+    _epoch_times = []
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     for epoch in range(start_epoch, num_epochs):
+        _epoch_t0 = time.time()
         # Check if spatial loss should be enabled based on validation loss threshold
         if (spatial_loss_module is not None and 
             not spatial_loss_enabled and 
@@ -786,6 +827,8 @@ def train_with_rectified_flow(
                     logger.info(f"Early stopping triggered after {epoch+1} epochs ({phase})")
                     early_stop = True
 
+        _epoch_times.append(time.time() - _epoch_t0)
+
         # --- Decoupled resume: save latest_checkpoint.pt EVERY epoch (unconditional) so
         #     --auto_resume continues from the last COMPLETED epoch, not the last val_mse
         #     improvement. best_checkpoint.pt stays improvement-only (block above).
@@ -805,6 +848,14 @@ def train_with_rectified_flow(
                 'val_mse': val_mse,
                 'spatial_loss_enabled': (spatial_loss_weight_current > 0),
                 'spatial_loss_start_epoch': spatial_loss_actual_start_epoch if spatial_loss_weight_current > 0 else None,
+                # Early-stop state, so --auto_resume continues the plateau count instead of
+                # restarting it, and so a run that ALREADY early-stopped is not silently trained
+                # further when SLURM requeues the job (e.g. preemption during the ~3h eval).
+                'early_stop_counter': counter,
+                'early_stopped': early_stop,
+                'early_stop_patience': patience,
+                # Verified by rectified_main.py before any --auto_resume continues this file.
+                'protocol': protocol_tag,
             }
             if model_config is not None:
                 _latest['config'] = model_config
@@ -825,5 +876,24 @@ def train_with_rectified_flow(
         if early_stop:
             break
 
-    return train_losses, val_losses
+    # Efficiency summary for the paper's 编码效率表. Mean per-epoch time excludes nothing (it is
+    # wall time per epoch including validation), and peak VRAM is the max over THIS INVOCATION
+    # (both accumulators reset above, so a resumed run emits one line per attempt and the collector
+    # aggregates them -- scripts/collect_efficiency.py). Both
+    # are unrecoverable after the fact, which is why they are logged rather than left to the user.
+    if rank == 0 and _epoch_times:
+        _peak = (torch.cuda.max_memory_allocated() / (1024 ** 3)) if torch.cuda.is_available() else -1.0
+        logger.info(
+            "EFFICIENCY_STATS "
+            f"epochs_timed={len(_epoch_times)} "
+            f"mean_epoch_sec={sum(_epoch_times) / len(_epoch_times):.1f} "
+            f"min_epoch_sec={min(_epoch_times):.1f} "
+            f"max_epoch_sec={max(_epoch_times):.1f} "
+            f"peak_vram_gb={_peak:.2f}"
+        )
+
+    # Return best_val_loss too: main's copy is the value it PASSED IN (inf on a fresh run) and is
+    # never written back, so anything main reports from its own variable is wrong. This is the
+    # val_mse the best checkpoint was selected on -- the number the paper's selection rule names.
+    return train_losses, val_losses, best_val_loss
 

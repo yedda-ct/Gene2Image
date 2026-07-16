@@ -17,6 +17,7 @@ Usage:
 """
 import os
 import re
+import csv
 import json
 import glob
 import argparse
@@ -50,6 +51,55 @@ METRIC_KEYS = {
 }
 
 
+EPOCH_RE = re.compile(r'Epoch (\d+)/(\d+) - Train Loss')          # rectified_train.py
+LASTEP_RE = re.compile(r'TRAIN_GATES [^\n]*last_epoch=(\d+)')     # rectified_main.py
+
+
+def _stop_epoch(run_dir):
+    """Epochs actually completed by this run, or None.
+
+    training_losses.csv alone is NOT the answer. rectified_train.py re-initialises train_losses per
+    process and rectified_main.py rewrites the CSV with rows renumbered from 1, so after an
+    --auto_resume it holds ONLY the final segment. The array's walltime (24h) is shorter than c1
+    (~33h) and p1 (~44h), so resume is the DESIGNED path: a CSV-only reading would report ~15-25
+    for most runs that in fact trained the full 50. The paper reads this column as proof the
+    budgets were equal and treats "< 50" as truncated-and-excludable, so that would discard most of
+    the matrix -- and would contradict validate_runs.py:167, which already takes the max.
+
+    So take max(csv rows, the log's last epoch), exactly as validate_runs.py does.
+    """
+    n_csv = None
+    csv_path = os.path.join(run_dir, 'training_losses.csv')
+    if os.path.isfile(csv_path):
+        try:
+            with open(csv_path) as f:
+                r = csv.reader(f)
+                next(r, None)                       # header
+                n_csv = sum(1 for _ in r) or None
+        except Exception:
+            n_csv = None
+
+    # Per-run log: <results_root>/logs/exp_<variant>_<ds>_s<seed>.log -- written by run_all.sh and
+    # tee -a'd by capella_array_1gpu.slurm, so it survives resumes and carries the true last epoch.
+    n_log = None
+    m = RUN_RE.search(os.path.basename(run_dir.rstrip('/')))
+    if m:
+        log_path = os.path.join(os.path.dirname(run_dir.rstrip('/')), 'logs',
+                                f"exp_{m.group('variant')}_{m.group('ds')}_s{m.group('seed')}.log")
+        if os.path.isfile(log_path):
+            try:
+                with open(log_path, errors='ignore') as f:
+                    for line in f:
+                        mg = LASTEP_RE.search(line) or EPOCH_RE.search(line)
+                        if mg:
+                            n_log = max(n_log or 0, int(mg.group(1)))
+            except Exception:
+                n_log = None
+
+    vals = [v for v in (n_csv, n_log) if v]
+    return max(vals) if vals else None
+
+
 def collect(results_root):
     """Return a long DataFrame of all evaluation_summary.json found under results_root."""
     rows = []
@@ -81,6 +131,12 @@ def collect(results_root):
             rec['dataset'] = 'unknown'
             rec['seed'] = data.get('seed')
         rec['eval_path'] = jpath
+        # Realized training length. Early stopping is OFF (--patience 9999), so this should be 50
+        # for every arm, and the paper prints it beside the metrics as EVIDENCE that all arms got the
+        # same budget. A value below 50 therefore means the run was TRUNCATED (preemption/walltime),
+        # not that it converged early -- that run must be resumed, not reported.
+        # Row count of training_losses.csv == epochs completed by the last invocation.
+        rec['stop_epoch'] = _stop_epoch(os.path.dirname(jpath))
         for src_key, name in METRIC_KEYS.items():
             v = data.get(src_key)
             if v is not None and not (isinstance(v, float) and np.isnan(v)):
@@ -102,6 +158,11 @@ def aggregate(df, expected_seeds=None):
     if df.empty:
         return df
     present = [m for m in METRIC_KEYS.values() if m in df.columns]
+    # stop_epoch aggregates like a metric: the paper prints it next to FID/SSIM/PSNR as evidence
+    # that every arm got the same budget. With early stopping off it should read 50.00 +/- 0.00 for
+    # all of them; anything less is a truncated (preempted) run to resume, not a converged one.
+    if 'stop_epoch' in df.columns and df['stop_epoch'].notna().any():
+        present = present + ['stop_epoch']
     grp = df.groupby(['variant', 'dataset'])
     g = grp[present].agg(['mean', 'std'])
     g.columns = [f'{m}_{stat}' for m, stat in g.columns]
@@ -166,24 +227,65 @@ def collect_cross(results_root):
         elif m_eval.group(1) == src:
             rec['fid_same'] = fid
     rows = [r for r in runs.values() if 'fid_cross' in r and 'fid_same' in r]
+
+    # The paper (v10 「编码效率与跨 panel 探索」) asks for the transplanted model to be reported
+    # "并与目标数据集内训练的 Gene2Image 参考结果并列" -- side by side with a Gene2Image TRAINED ON
+    # THE TARGET. That reference is NOT fid_same: fid_same is the source model on its own source
+    # panel, which answers "how much worse is it away from home", a different question from "how far
+    # short of a native model does transplanting land". The native number already exists -- it is the
+    # main matrix's gene2image_<tgt>_seed<seed> -- so pull it in rather than leave the column empty.
+    native = {}
+    for jpath in glob.glob(os.path.join(results_root, '**', 'evaluation_summary.json'), recursive=True):
+        if os.path.basename(os.path.dirname(jpath)).startswith('eval_on_'):
+            continue
+        mm = RUN_RE.search(os.path.basename(os.path.dirname(jpath)))
+        if not mm:
+            continue
+        try:
+            with open(jpath) as f:
+                v = json.load(f).get('overall_fid')
+        except Exception:
+            continue
+        if v is not None and not (isinstance(v, float) and np.isnan(v)):
+            native[(mm.group('variant'), mm.group('ds'), int(mm.group('seed')))] = v
+
     for r in rows:
         r['degradation_rate'] = ((r['fid_cross'] - r['fid_same']) / r['fid_same']
                                  if r['fid_same'] else float('nan'))
+        # Same variant, same seed, but trained on the TARGET panel.
+        r['fid_target_native'] = native.get((r['model'], r['tgt'], r['seed']))
+        # How far the transplant lands from a model that actually trained on this panel. Positive =
+        # worse than native. Left NaN when the native run is missing rather than silently reusing
+        # fid_same, which would answer a different question under the same column name.
+        r['gap_vs_native'] = ((r['fid_cross'] - r['fid_target_native']) / r['fid_target_native']
+                              if r.get('fid_target_native') else float('nan'))
     return pd.DataFrame(rows)
 
 
 def aggregate_cross(df, expected_seeds=None):
-    """Mean +/- std of fid_cross/fid_same/degradation_rate per (model, setting).
+    """Mean +/- std of the cross-panel columns per (model, setting).
+
+    Columns, and what each answers:
+      fid_cross          transplanted source model, evaluated on the TARGET panel
+      fid_same           the same model on its own SOURCE panel  -> degradation_rate's denominator
+      degradation_rate   (cross - same)/same: how much worse away from home
+      fid_target_native  a model of the same variant/seed TRAINED on the target (from the main
+                         matrix) -- the reference the paper asks to print alongside
+      gap_vs_native      (cross - native)/native: how far short of a native model the transplant lands
 
     Also emits n_seeds and warns on incomplete groups (mirrors aggregate()), so a dropped
-    cross run does not silently shrink the degradation_rate sample without notice.
+    cross run does not silently shrink the sample without notice.
     """
     if df.empty:
         return df
     df = df.copy()
     df['setting'] = df['src'].str.upper() + '->' + df['tgt'].str.upper()
     grp = df.groupby(['model', 'setting'])
-    g = grp[['fid_cross', 'fid_same', 'degradation_rate']].agg(['mean', 'std'])
+    _cols = ['fid_cross', 'fid_same', 'degradation_rate']
+    for _c in ('fid_target_native', 'gap_vs_native'):
+        if _c in df.columns and df[_c].notna().any():
+            _cols.append(_c)
+    g = grp[_cols].agg(['mean', 'std'])
     g.columns = [f'{m}_{stat}' for m, stat in g.columns]
     g = g.reset_index()
     g = g.merge(grp.size().reset_index(name='n_seeds'), on=['model', 'setting'])

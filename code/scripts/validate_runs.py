@@ -19,7 +19,7 @@
 #
 # 用法:
 #   python scripts/validate_runs.py --results_root results \
-#          --expected_epochs 50 --patience 5
+#          --expected_epochs 50 --patience 9999
 #   # 变体/数据集/seed/期望种子数可覆盖;默认对齐 run_all.sh 的 6x3x3=54。
 #
 # 退出码:0 = 全部 run 通过 (a)-(e) 且主对比合理;非 0 = 有 run 不合格。
@@ -61,10 +61,16 @@ def load_ckpt_val_mse(ckpt_path):
     return ('val_mse' in ck, ck.get('val_mse'), ck.get('epoch'))
 
 
+DOPRI5_RE = re.compile(
+    r'DOPRI5_DIAGNOSTICS rejected=(\d+) dt_floor=(\d+) '
+    r'under_integration_fallback=(\d+) final_t=([0-9.]+)')
+
+
 def parse_log(log_path):
-    """Return dict(last_epoch, budget, early_stop_epoch, has_valmse_line) from a run log."""
+    """Return dict(last_epoch, budget, early_stop_epoch, has_valmse_line, dopri5_*) from a run log."""
     info = {'last_epoch': None, 'budget': None, 'early_stop_epoch': None,
-            'has_valmse_line': False, 'exists': False}
+            'has_valmse_line': False, 'exists': False,
+            'dopri5_lines': 0, 'dopri5_dt_floor': 0, 'dopri5_fallback': 0, 'dopri5_bad_t': 0}
     if not os.path.isfile(log_path):
         return info
     info['exists'] = True
@@ -79,6 +85,15 @@ def parse_log(log_path):
                 info['early_stop_epoch'] = int(me.group(1))
             if VALMSE_RE.search(line):
                 info['has_valmse_line'] = True
+            # Solver gates 1-2 (see check_run): rejected steps are NORMAL adaptive behaviour and
+            # are not a failure; dt-floor force-accepts and under-integration top-ups are not.
+            md = DOPRI5_RE.search(line)
+            if md:
+                info['dopri5_lines'] += 1
+                info['dopri5_dt_floor'] += int(md.group(2))
+                info['dopri5_fallback'] += int(md.group(3))
+                if abs(float(md.group(4)) - 1.0) > 1e-6:
+                    info['dopri5_bad_t'] += 1
     return info
 
 
@@ -175,6 +190,28 @@ def check_run(root, variant, ds, seed, expected_epochs, patience, logs_dir):
         if final_epoch < patience + 1 and not reached_budget:
             notes.append('WARN: suspiciously few epochs')
 
+    # Run gates 1-2 (paper 「评价指标与统计方法」): dt_floor == 0 and under_integration_fallback == 0.
+    # dt_floor>0 = steps force-accepted over tolerance; fallback>0 = the solver never reached t=1 and
+    # the image is under-integrated. Rejected steps are normal and deliberately NOT a failure here.
+    # These live only in the per-run log, so they can only be checked when that log exists.
+    if log['exists'] and log['dopri5_lines'] > 0:
+        if log['dopri5_dt_floor'] > 0:
+            problems.append(f"DOPRI5 forced {log['dopri5_dt_floor']} step(s) at the dt-floor "
+                            f"(over tolerance) across {log['dopri5_lines']} generation(s)")
+        if log['dopri5_fallback'] > 0:
+            problems.append(f"DOPRI5 hit the under-integration fallback {log['dopri5_fallback']} "
+                            f"time(s) -> images generated without reaching t=1")
+        if log['dopri5_bad_t'] > 0:
+            problems.append(f"{log['dopri5_bad_t']}/{log['dopri5_lines']} DOPRI5 generation(s) "
+                            f"did not reach final_t=1.0")
+        if not (log['dopri5_dt_floor'] or log['dopri5_fallback'] or log['dopri5_bad_t']):
+            notes.append(f"dopri5 clean ({log['dopri5_lines']} gen)")
+    elif log['exists']:
+        notes.append('WARN: no DOPRI5_DIAGNOSTICS in log -> solver gates unverified')
+    else:
+        notes.append('WARN: per-run log absent -> solver gates unverified '
+                     '(array must tee to results/logs/exp_<v>_<ds>_s<seed>.log)')
+
     # (e) eval 指标可用
     fid = None
     if os.path.exists(eval_path):
@@ -186,6 +223,40 @@ def check_run(root, variant, ds, seed, expected_epochs, patience, logs_dir):
             fid = d.get('overall_fid')
             if fid is None or (isinstance(fid, float) and not math.isfinite(fid)):
                 problems.append('overall_fid missing/NaN in evaluation_summary.json')
+            # UNI2-h biological FID must be finite too. The `miss` check above only tests key
+            # PRESENCE, and rectified_evaluate always writes the key -- so a NaN parses back
+            # as float('nan') and the run passes. That blind spot is exactly how the previous
+            # 54-run batch shipped 54 NaN biological FIDs unnoticed.
+            ufid = d.get('overall_uni2h_fid')
+            if ufid is None or (isinstance(ufid, float) and not math.isfinite(ufid)):
+                problems.append('overall_uni2h_fid missing/NaN — UNI2-h weights were not '
+                                'loaded (check UNI2H_MODEL_PATH); biological FID is unusable')
+            # Run gate 3 (paper 「评价指标与统计方法」): n_ssim_used == n_psnr_used == total_samples.
+            # A shortfall means rows were dropped as non-finite and the reported means silently
+            # cover fewer samples than the table claims.
+            tot, ns, npsnr = d.get('total_samples'), d.get('n_ssim_used'), d.get('n_psnr_used')
+            if None in (tot, ns, npsnr):
+                problems.append('evaluation_summary.json lacks total_samples/n_ssim_used/'
+                                'n_psnr_used -> cannot verify no samples were silently dropped')
+            elif ns != tot or npsnr != tot:
+                problems.append(f'non-finite samples dropped: n_ssim_used={ns}, n_psnr_used={npsnr}, '
+                                f'total_samples={tot} -> reported SSIM/PSNR means cover fewer '
+                                f'samples than the table implies')
+            # A tile that failed to decode is replaced by a BLACK image (src/dataset.py). That image
+            # becomes the "real" one the model is scored against and enters the FID reference stats,
+            # while staying finite -- so the check above cannot see it.
+            _zsub = d.get('zero_image_substitutions')
+            if _zsub is None:
+                # The current evaluator writes this key unconditionally, so its absence means the
+                # run came from an older build. Say so rather than pass silently: a black tile that
+                # was scored as ground truth is finite, so no other check here can see it, and a
+                # quiet skip would read as "verified clean".
+                notes.append('WARN: no zero_image_substitutions in evaluation_summary.json -> '
+                             'black-tile contamination UNVERIFIED (run predates the counter)')
+            elif isinstance(_zsub, int) and _zsub > 0:
+                problems.append(f'{_zsub} unreadable tile(s) were replaced by BLACK images and '
+                                f'scored as ground truth -> FID/SSIM/PSNR are contaminated; fix the '
+                                f'source .tif files and re-evaluate')
         except Exception as e:
             problems.append(f'evaluation_summary.json unreadable: {e}')
 
@@ -201,8 +272,10 @@ def main():
     ap.add_argument('--seeds', nargs='*', type=int, default=SEEDS)
     ap.add_argument('--expected_epochs', type=int, default=50,
                     help='Target epoch budget (run_all.sh default EPOCHS=50).')
-    ap.add_argument('--patience', type=int, default=5,
-                    help='Early-stopping patience used in training (main.py default 5).')
+    ap.add_argument('--patience', type=int, default=9999,
+                    help='Early-stopping patience USED IN TRAINING. Must match it: this decides '
+                         'whether an early stop happened at a legitimate epoch. The formal protocol '
+                         'is 9999 (early stopping off), not main.py argparse default of 5.')
     ap.add_argument('--logs_dir', default=None, help='Per-job logs dir (default: <results_root>/logs).')
     ap.add_argument('--rerun_summarize', action='store_true',
                     help='Re-run summarize_results.py and print the main comparison.')

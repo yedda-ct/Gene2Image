@@ -3,11 +3,14 @@
 # Capella TRAIN 4-GPU — full node, 4 experiments in PARALLEL, one per GPU, via
 # run_all.sh's built-in scheduler (MAX_PARALLEL=4). NOT DDP: each experiment is a
 # normal single-GPU run pinned with CUDA_VISIBLE_DEVICES, so no unvalidated
-# multi-GPU training path. EPOCHS=50, early-stop off, --auto_resume (resumable).
+# multi-GPU training path. EPOCHS=50, early-stop off (--patience 9999), --auto_resume.
 #
 # BATCH selects a chunk so a job fits the walltime and queues fast:
 #   BATCH=1 -> c1   BATCH=2 -> c2   BATCH=3 -> p1   (each = 6 variants x 3 seeds = 18 runs)
-#   BATCH=4 -> cross-dataset + RQ4 interpret + summary (after 1-3 finish)
+#   BATCH=4 -> RQ4 interpret + summary ONLY (after 1-3 finish).
+#              Cross-dataset is NOT part of this any more: each of its 9 settings TRAINS a model for
+#              50 epochs (~300 GPU-h total) and cannot fit this job's 12h walltime. Use the
+#              dedicated array instead:  sbatch --array=0-8 slurm/capella_cross_1gpu.slurm
 #   (unset)  -> whole matrix c1 c2 p1 (won't fit 12h; prefer BATCH=1/2/3, resubmit/resume as needed)
 # Resources: 4 GPU, 56 CPU, 700G, 12h (default short; capella_train_4gpu_long.slurm for >12h).
 # Run:  sbatch --export=ALL,BATCH=1 slurm/capella_train_4gpu.slurm

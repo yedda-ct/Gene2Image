@@ -5,7 +5,7 @@
 # --auto_resume/--requeue (split into short jobs) over this. Full node, 4 experiments PARALLEL, via
 # run_all.sh's built-in scheduler (MAX_PARALLEL=4). NOT DDP: each experiment is a
 # normal single-GPU run pinned with CUDA_VISIBLE_DEVICES, so no unvalidated
-# multi-GPU training path. EPOCHS=50, early-stop off, --auto_resume (resumable).
+# multi-GPU training path. EPOCHS=50, early-stop off (--patience 9999), --auto_resume.
 #
 # BATCH selects a chunk so a job fits the walltime and queues fast:
 #   BATCH=1 -> c1   BATCH=2 -> c2   BATCH=3 -> p1   (each = 6 variants x 3 seeds = 18 runs)

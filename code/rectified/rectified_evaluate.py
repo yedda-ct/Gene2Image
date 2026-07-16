@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import json
 import torch
 import logging
@@ -359,7 +360,13 @@ def main():
         if uni2h_model is not None:  # ← Check model, not processor
             logger.info("UNI2-h model loaded successfully for biological validation")
         else:
-            logger.info("UNI2-h model unavailable, using ResNet fallback")
+            # There is NO fallback -- the old "using ResNet fallback" wording was fiction and read
+            # as "something else is still computing it", which is how a run with no biological FID
+            # at all looks fine at a glance. Say what actually happens.
+            logger.warning("UNI2-h model unavailable: NO biological validation will be computed and "
+                           "overall_uni2h_fid will be NaN. This is exactly what invalidated the "
+                           "previous 54-run batch. Set UNI2H_MODEL_PATH to a dir containing "
+                           "pytorch_model.bin, or pass ALLOW_NO_UNI2H=1 to accept it deliberately.")
 
     # Load HE2RNA model for RNA prediction validation
     he2rna_model = None
@@ -910,6 +917,14 @@ def main():
     if rank == 0:
         logger.info(f"Starting evaluation on {len(eval_loader)} batches")
 
+    # Generation-time accumulators for the paper's 单样本推理时间 column (see the timed block below).
+    _gen_seconds = 0.0
+    _gen_samples = 0
+    # Tiles that failed to decode and were replaced by a BLACK image (src/dataset.py). Summed from
+    # the batch, NOT from a class counter: __getitem__ runs in DataLoader worker processes, so a
+    # class-level count never reaches this process and a gate on it could never fire.
+    _n_zero_sub = 0
+
     with torch.no_grad():
         # Create progress bar only on rank 0
         if rank == 0:
@@ -925,15 +940,29 @@ def main():
             if ckpt_model_type == 'single':
                 gene_expr = batch['gene_expr'].to(device)
                 sample_ids_in_batch = batch['cell_id']
+                _zs = batch.get('is_zero_substituted')
+                if _zs is not None:
+                    _n_zero_sub += int(_zs.sum()) if hasattr(_zs, 'sum') else int(sum(_zs))
                 gene_mask = batch.get('gene_mask', None)
                 if gene_mask is not None:
                     gene_mask = gene_mask.to(device)
 
+                # Time the generation itself for the paper's 编码效率表 (单样本推理时间).
+                # synchronize on both sides: CUDA is async, so without it this would measure kernel
+                # launch time, not the work. Wall-time per sample is unrecoverable once the job
+                # ends, which is why it is measured here rather than left to be reconstructed.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _gen_t0 = time.perf_counter()
                 generated_images_tensor = generate_images_with_rectified_flow(
                     model, rectified_flow, gene_expr, device, args.gen_steps,
                     gene_mask=gene_mask, is_multi_cell=False,
                     sample_ids=sample_ids_in_batch
                 )
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _gen_seconds += time.perf_counter() - _gen_t0
+                _gen_samples += int(gene_expr.shape[0])
             else:  # multi-cell
                 processed_batch = prepare_multicell_batch(batch, device)
                 gene_expr = processed_batch['gene_expr']
@@ -1313,6 +1342,41 @@ def main():
             'pathway_db': model_config_ckpt.get('pathway_db', getattr(args, 'pathway_db', None)),
             'seed': getattr(args, 'seed', None),
         }
+
+        # One machine-readable line carrying every value the validity gates need, so a run can be
+        # audited from the LOG ALONE -- no results/ directory, no evaluation_summary.json. That
+        # matters because the logs are what comes back from the cluster first (and are small enough
+        # to hand around), while these numbers otherwise live only in the JSON. Paired with the
+        # DOPRI5_DIAGNOSTICS line from the sampler, this makes the log self-sufficient:
+        #   gate 1-2 (dt_floor / under_integration_fallback) -> DOPRI5_DIAGNOSTICS
+        #   gate 3   (n_ssim_used == n_psnr_used == total_samples) -> here
+        #   UNI2-h NaN (what invalidated the previous 54-run batch)  -> here
+        results_summary['zero_image_substitutions'] = _n_zero_sub
+        # 单样本推理时间 for the efficiency table. Report gen_steps alongside it: DOPRI5 is adaptive,
+        # so seconds/sample is meaningless without the step budget it ran under.
+        results_summary['gen_seconds_total'] = round(_gen_seconds, 3)
+        results_summary['gen_samples_timed'] = _gen_samples
+        results_summary['sec_per_sample'] = round(_gen_seconds / _gen_samples, 4) if _gen_samples else None
+        logger.info(
+            "EVAL_GATES "
+            f"total_samples={results_summary['total_samples']} "
+            f"n_ssim_used={results_summary['n_ssim_used']} "
+            f"n_psnr_used={results_summary['n_psnr_used']} "
+            f"overall_fid={results_summary['overall_fid']:.6g} "
+            f"overall_uni2h_fid={results_summary['overall_uni2h_fid']:.6g} "
+            f"mean_ssim={results_summary['mean_ssim']:.6g} "
+            f"mean_psnr={results_summary['mean_psnr']:.6g} "
+            f"encoder_type={results_summary['encoder_type']} "
+            f"seed={results_summary['seed']} "
+            f"gen_steps={results_summary['generation_steps']} "
+            # Tiles that failed to decode and were replaced by a BLACK image. Nonzero means some
+            # "real" image a model was scored against was fabricated, and those pixels also entered
+            # the FID reference statistics -- invisible to the finite-value gate, since a black
+            # image's SSIM/PSNR are finite.
+            f"zero_image_substitutions={_n_zero_sub} "
+            f"sec_per_sample={results_summary['sec_per_sample']} "
+            f"gen_samples_timed={_gen_samples}"
+        )
 
         # Add biological metrics to results summary
         results_summary.update(biological_summary)

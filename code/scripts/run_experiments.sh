@@ -32,7 +32,16 @@ BATCH_SIZE=${BATCH_SIZE:-16}
 EPOCHS=${EPOCHS:-50}          # 对齐 GeneFlow 源代码 train.sh(EPOCHS=50)
 GEN_STEPS=${GEN_STEPS:-100}
 WORKERS=${WORKERS:-4}
-EXTRA=${EXTRA:-"--use_amp"}
+# --patience 9999 = early stopping OFF, so every arm gets the same 50-epoch budget. This is the
+# ONE deliberate divergence from GeneFlow's train.sh (which sets PATIENCE=5); batch 16 / 50 epochs
+# / lr 1e-4 / wd 0.01 all follow it verbatim. Rationale: with patience=5 arms stop at different
+# epochs (the previous batch measured gene2image ~26.6 vs geneflow ~14.9), which entangles the
+# encoder effect -- the paper's whole claim -- with how long each arm happened to train, and that
+# was one of the four reasons the previous 54-run batch was thrown away. Since the reported
+# checkpoint is the val_mse minimum rather than the last epoch, training the full budget only
+# WIDENS the search for every arm (including the GeneFlow baseline) and cannot overfit what is
+# reported. Costs compute, not correctness.
+EXTRA=${EXTRA:-"--use_amp --patience 9999"}
 # Eval does not accept training-only flags like --use_amp; keep its extras separate.
 EVAL_EXTRA=${EVAL_EXTRA:-}
 
@@ -69,12 +78,20 @@ run_one() {
     gene2image) enc_args="--encoder_type pathway --pathway_mask $MASK_DIR/${ds}_${DB}_real.npz" ;;
     geneflow)   enc_args="--encoder_type rna" ;;
     randpath)
-      # Per-seed random mask so RQ2's 3-seed std includes random-mask draw variance;
-      # fall back to the shared rand mask (with a note) if the per-seed one is absent.
+      # Per-seed random mask: RQ2 claims randPath's 3-seed std reflects random-mask DRAW
+      # variance, not just optimization noise. Falling back to the shared rand mask would
+      # give all 3 seeds the SAME mask and quietly collapse that claim into "one random
+      # draw, trained 3x" -- a weaker result reported as the stronger one. Fail instead:
+      # ensure_masks_for / run_all.sh PHASE 0 build these, so a miss means the masks are
+      # wrong, and a loud stop costs minutes where a silent downgrade costs the claim.
       local rmask="$MASK_DIR/${ds}_${DB}_rand_s${seed}.npz"
       if [ ! -f "$rmask" ]; then
-        rmask="$MASK_DIR/${ds}_${DB}_rand.npz"
-        echo "  (randpath: per-seed rand mask ${ds}_${DB}_rand_s${seed}.npz absent; using shared $rmask)"
+        echo "[FATAL] randpath needs the per-seed rand mask: $rmask" >&2
+        echo "        Refusing to fall back to the shared ${ds}_${DB}_rand.npz -- that would" >&2
+        echo "        give every seed the same mask and invalidate RQ2's mask-draw variance." >&2
+        echo "        Build it: python scripts/build_pathway_mask.py --adata <adata> --prefix $ds \\" >&2
+        echo "                    --db $DB --gmt <hallmark.gmt> --out_dir $MASK_DIR --seed 42 --rand_seeds 42 43 44" >&2
+        exit 105
       fi
       enc_args="--encoder_type pathway --pathway_mask $rmask" ;;
     pathprior)  enc_args="--encoder_type pathway --pathway_mask $MASK_DIR/${ds}_${DB}_real.npz --no_learnable_pathway" ;;

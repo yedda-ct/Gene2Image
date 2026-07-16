@@ -54,8 +54,19 @@ PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.5}"
 DATA_ROOT="${DATA_ROOT:-$PROJECT_DIR/data/processed_data}"
 MASK_DIR="${MASK_DIR:-$PROJECT_DIR/data/pathway_masks}"
 OUT_ROOT="${OUT_ROOT:-$PROJECT_DIR/results}"
-export UNI2H_MODEL_PATH="${UNI2H_MODEL_PATH:-}"          # UNI2-h weights dir (else UNI2-h FID = NaN)
+# This script does NOT source slurm/_capella_common.sh -- it carries its own site setup -- so the
+# UNI2-h pin and fail-fast must be repeated here. An empty default is how the previous 54-run batch
+# was invalidated: utils_uni2h caught the missing weights, logged a WARNING, and the evaluator wrote
+# overall_uni2h_fid = NaN while the job still exited 0.
+export UNI2H_MODEL_PATH="${UNI2H_MODEL_PATH:-$PROJECT_DIR/../../models/UNI2-h}"
 export HE2RNA_MODEL_PATH="${HE2RNA_MODEL_PATH:-}"
+if [ "${ALLOW_NO_UNI2H:-0}" != "1" ] && [ ! -f "$UNI2H_MODEL_PATH/pytorch_model.bin" ]; then
+  echo "[FATAL] UNI2-h weights not found: $UNI2H_MODEL_PATH/pytorch_model.bin"
+  echo "        Biological FID would be NaN on every run and the job would still exit 0."
+  echo "        Fix: export UNI2H_MODEL_PATH=/path/to/UNI2-h  (dir containing pytorch_model.bin)"
+  echo "        Or:  ALLOW_NO_UNI2H=1 to run anyway WITHOUT biological FID."
+  exit 104
+fi
 GMT_HALLMARK="${GMT_HALLMARK:-$PROJECT_DIR/../gmt/msigdb_2023.2_Hs/h.all.v2023.2.Hs.symbols.gmt}"
 
 module --force purge >/dev/null 2>&1 || module purge || true
@@ -83,8 +94,16 @@ echo "Visible GPUs: ${N_GPU}"
 # -----------------------------------------------------------------------------
 if [ "${MODE:-run}" = "prep" ]; then
   [ -f "${GMT_HALLMARK}" ] || { echo "ERROR: Hallmark GMT not at ${GMT_HALLMARK}"; exit 111; }
+  # MASKS_ONLY=1 is what makes this a real prep job: run_all.sh stops after PHASE 0/0.5.
+  # It replaces the old VARIANTS="" trick, which did NOT stop training — build_train_jobs
+  # gates cross-dataset on INCLUDE_CROSS (not VARIANTS), so VARIANTS="" still queued
+  # 3 pairs x 3 seeds = 9 full 50-epoch run_cross_dataset.sh trainings. Those blew past
+  # this job's 30-min walltime, prep exited non-zero, and `sbatch --dependency=afterok:$PREP`
+  # left the whole 54-task array stuck in DependencyNeverSatisfied.
+  # VARIANTS is now the real list so PHASE 0.5 asserts every mask the 54-run will load.
   DATA_ROOT="$DATA_ROOT" MASK_DIR="$MASK_DIR" OUT_ROOT="$OUT_ROOT" GMT_HALLMARK="$GMT_HALLMARK" \
-  SEEDS="42 43 44" VARIANTS="" INCLUDE_CROSS=1 INCLUDE_INTERPRET=0 DRY_RUN="${DRY_RUN:-0}" \
+  SEEDS="42 43 44" DATASETS="c1 c2 p1" INCLUDE_CROSS=1 INCLUDE_INTERPRET=0 \
+  MASKS_ONLY=1 DRY_RUN="${DRY_RUN:-0}" \
     bash scripts/run_all.sh 1
   echo "[ok] prep done"; exit 0
 fi
@@ -102,7 +121,7 @@ fi
 # -----------------------------------------------------------------------------
 # MODE=run : one array task = up to 4 experiments (one per GPU), run in parallel.
 #   The 54 (variant,dataset,seed) triples are a fixed list; task t = triples[4t..4t+3].
-#   Masks must already exist (MODE=prep). Fixed EPOCHS=50, early-stop off,
+#   Masks must already exist (MODE=prep). Fixed EPOCHS=50, early-stop off (--patience 9999),
 #   --auto_resume; best checkpoint still selected on val_mse.
 # -----------------------------------------------------------------------------
 VARIANTS=(gene2image geneflow randpath pathprior notrans nomask)

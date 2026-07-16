@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 class CellImageGeneDataset(Dataset):
     """Dataset for cell images and gene expression profiles, supporting in-memory images."""
-
     def __init__(self, expr_df, image_paths, img_size=256, img_channels=3,
                  transform=None, missing_gene_symbols=None, normalize_aux=False):
         self.expr_df = expr_df
@@ -84,6 +83,7 @@ class CellImageGeneDataset(Dataset):
                 gene_mask[indices_to_zero] = 0
 
         img_source = self.image_paths[cell_id]
+        is_zero_substituted = 0   # set on the decode-failure path below; must exist on every branch
         # If it's a numpy array, treat as in-memory patch
         if isinstance(img_source, np.ndarray):
             patch = img_source
@@ -103,19 +103,30 @@ class CellImageGeneDataset(Dataset):
                 pil_img = PILImage.fromarray(image)
                 image = self.transform(pil_img) if self.transform else transforms.ToTensor()(pil_img)
             except Exception as e:
-                # Substitute a zero image with EXACTLY self.img_channels channels. The old
-                # fallback built a 3-channel PIL('RGB') image, which — when img_channels=4 —
-                # produces a mis-shaped sample that crashes the entire batch in default_collate
-                # (torch.stack) instead of skipping the one unreadable cell.
+                # Substitute a zero image with EXACTLY self.img_channels channels. The old fallback
+                # built a 3-channel PIL('RGB') image, which under img_channels=4 crashed the whole
+                # batch in default_collate (torch.stack) instead of skipping the one unreadable cell.
+                #
+                # But a silent black tile is its own hazard: at evaluation this becomes the REAL
+                # image a model is scored against, and its features enter the FID reference
+                # statistics. It also slips past the "no samples silently dropped" gate, because a
+                # black image's SSIM/PSNR are perfectly finite. So flag it PER SAMPLE and let the
+                # caller sum the flag -- never let this be invisible.
                 logger.error(f"Error loading image {img_source}: {e}; substituting a zero "
                              f"{self.img_channels}-channel image.")
+                is_zero_substituted = 1
                 image = torch.zeros(self.img_channels, self.img_size, self.img_size)
 
         return {
             'cell_id': cell_id,
             'gene_expr': gene_expr,
             'gene_mask': gene_mask,
-            'image': image
+            'image': image,
+            # Ride back with the sample rather than being counted on the class: __getitem__ runs in
+            # DataLoader WORKER PROCESSES (num_workers=14), so a class-level counter is incremented
+            # in the worker's own memory and the parent reads 0 forever -- a gate on it could never
+            # fire. Going through the batch is the only path that crosses the process boundary.
+            'is_zero_substituted': is_zero_substituted,
         }
 
 
